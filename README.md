@@ -14,43 +14,52 @@
 
 ---
 
-## 💻 Kompatibilitas Platform
+## 📋 Persyaratan Sistem & Dependensi (Requirements)
 
-TBOOST dirancang cerdas untuk mendeteksi sistem operasi secara otomatis dan mencegah kesalahan penggunaan:
+Sebelum menginstal, pastikan perangkat kamu memenuhi syarat berikut:
 
-1. **📱 Android (Termux)**: Mode khusus HP dengan Shizuku. Fitur Game Boost, Thermal Bypass, dan Resolusi.
-2. **💻 PC / Laptop (Linux / Ubuntu / WSL / macOS)**: Mode PC dengan akses Sudo untuk manajemen CPU Governor, RAM Cache, dan Jaringan.
+### 📱 Untuk Android (Termux)
+1. **Aplikasi Termux** (Unduh dari F-Droid).
+2. **Aplikasi Shizuku** (Play Store) - *Wajib aktif via Wireless Debugging*.
+3. **Aplikasi Termux:API** (F-Droid) - *Untuk notifikasi & getar*.
+4. **Dependensi CLI**: `termux-api`, `procps`, `coreutils`, `curl`, `git`.
 
-*(Jika kamu membuka Mode PC di HP, sistem akan otomatis memblokir fitur dan memberikan peringatan warna merah. Sebaliknya di PC, status akan hijau).*
+### 🐧 Untuk Linux / Ubuntu / WSL
+1. **Sistem Operasi**: Ubuntu 20.04+, Debian, Arch, atau WSL (Windows).
+2. **Dependensi CLI**: `procps`, `iputils-ping`, `lm-sensors`, `curl`, `git`.
+3. **Akses Sudo** (Diperlukan untuk optimasi CPU & RAM).
 
 ---
 
-## 🛠️ Cara Instalasi
+## 🛠️ Tutorial Instalasi Lengkap
 
-### 📱 A. Untuk Android (Termux)
-Buka aplikasi **Termux** (dari F-Droid), lalu jalankan:
+### 📱 A. Cara Install di Android (Termux)
+Buka aplikasi **Termux**, lalu jalankan perintah sakti ini (otomatis menginstal semua dependensi):
 ```bash
 curl -sL https://raw.githubusercontent.com/primasandy/gamebooster/main/install.sh | bash
 ```
-*(Wajib menginstal aplikasi Shizuku dan Termux:API).*
+Setelah selesai, ketik `tboost` untuk membuka menu.
 
-### 🐧 B. Untuk Linux / Ubuntu / WSL
-Buka Terminal PC/Laptop, lalu jalankan:
+### 💻 B. Cara Install di Linux / Ubuntu
+Buka Terminal PC/Laptop, lalu jalankan perintah berikut:
 ```bash
 git clone https://github.com/primasandy/gamebooster.git
 cd gamebooster
-chmod +x tboost tboost-pc
+chmod +x install-pc.sh
+./install-pc.sh
+```
+Setelah dependensi terinstal, jalankan mode PC dengan perintah:
+```bash
 ./tboost-pc
 ```
-*(Disarankan menggunakan akses `sudo` agar optimasi CPU dan RAM berjalan penuh).*
 
 ---
 
 ## 🎮 Cara Berpindah Mode
 
-Kamu bisa berpindah antara Mode HP dan Mode PC kapan saja dengan perintah:
-* Ketik `tboost hp` (Untuk masuk ke menu Android).
-* Ketik `tboost pc` (Untuk masuk ke menu PC/Linux).
+TBOOST dilengkapi sistem proteksi cerdas. Kamu bisa berpindah mode kapan saja:
+* `tboost hp` (Untuk masuk ke menu Android).
+* `tboost pc` (Untuk masuk ke menu PC/Linux).
 * Atau gunakan menu **[23] Switch to PC Mode** / **[9] Switch to HP Mode** di dalam aplikasi.
 
 ---
