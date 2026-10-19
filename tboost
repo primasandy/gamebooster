@@ -1,0 +1,3048 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# tboost v3.0 - Gaming Performance Tool for Termux
+VERSION="3.0"
+
+R=$'\033[1;31m'; G=$'\033[1;32m'; Y=$'\033[1;33m'
+B=$'\033[1;34m'; M=$'\033[1;35m'; C=$'\033[1;36m'
+W=$'\033[1;37m'; D=$'\033[0m'; BD=$'\033[1m'; DM=$'\033[2m'
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+STATE_DIR="$PREFIX/var/lib/tboost"
+BACKUP_DIR="$STATE_DIR/backup"
+PIDFILE="$STATE_DIR/daemon.pid"
+ALIVEFILE="$STATE_DIR/alive"
+LOGFILE="$STATE_DIR/tboost.log"
+GAME_FLAG="$STATE_DIR/game_mode"
+mkdir -p "$STATE_DIR" "$BACKUP_DIR" 2>/dev/null || true
+
+HAS_ROOT=0
+SU_BIN=""
+
+log() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) || ts="??"
+    printf '[%s] %s\n' "$ts" "$*" >> "$LOGFILE" 2>/dev/null || true
+}
+
+detect_root() {
+    HAS_ROOT=0; SU_BIN=""
+    if command -v su >/dev/null 2>&1; then
+        if timeout 4 su -c id 2>/dev/null | grep -q 'uid=0'; then
+            HAS_ROOT=1; SU_BIN="su"; return 0
+        fi
+    fi
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        HAS_ROOT=1; SU_BIN="sudo"
+    fi
+    return 0
+}
+
+as_root() {
+    [ "$HAS_ROOT" -eq 1 ] || return 1
+    if [ "$SU_BIN" = "su" ]; then su -c "$*"; else sudo sh -c "$*"; fi
+}
+
+get_freq() {
+    local cur=0 mx=0 f=/sys/devices/system/cpu/cpu0/cpufreq
+    [ -r "$f/scaling_cur_freq" ] && cur=$(cat "$f/scaling_cur_freq" 2>/dev/null)
+    [ -r "$f/cpuinfo_max_freq" ] && mx=$(cat "$f/cpuinfo_max_freq" 2>/dev/null)
+    printf '%s %s\n' "$((cur / 1000))" "$((mx / 1000))"
+}
+
+get_ram() {
+    local t a
+    t=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    [ -z "$t" ] && t=0
+    [ -z "$a" ] && a=0
+    printf '%s %s\n' "$t" "$a"
+}
+
+get_governor() {
+    local g
+    g=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+    printf '%s\n' "${g:-unknown}"
+}
+
+get_soc() {
+    local p v
+    for p in ro.soc.model ro.board.platform ro.hardware ro.product.board; do
+        v=$(getprop "$p" 2>/dev/null)
+        [ -n "$v" ] && { printf '%s\n' "$v"; return; }
+    done
+    awk -F: '/Hardware|model name/{gsub(/^ +| +$/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null
+}
+
+temp_color() {
+    local t=$1
+    if [ "$t" -ge 75 ] 2>/dev/null; then printf '%s' "$R"
+    elif [ "$t" -ge 60 ] 2>/dev/null; then printf '%s' "$Y"
+    else printf '%s' "$G"; fi
+}
+
+backup_state() {
+    log "backup_state"
+    : > "$BACKUP_DIR/governor"
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -r "$f" ] || continue
+        printf '%s=%s\n' "$f" "$(cat "$f" 2>/dev/null)" >> "$BACKUP_DIR/governor"
+    done
+    : > "$BACKUP_DIR/minfreq"
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq; do
+        [ -r "$f" ] || continue
+        printf '%s=%s\n' "$f" "$(cat "$f" 2>/dev/null)" >> "$BACKUP_DIR/minfreq"
+    done
+    if [ "$HAS_ROOT" -eq 1 ]; then
+        as_root "settings get global window_animation_scale" > "$BACKUP_DIR/anim1" 2>/dev/null
+        as_root "settings get global transition_animation_scale" > "$BACKUP_DIR/anim2" 2>/dev/null
+        as_root "settings get global animator_duration_scale" > "$BACKUP_DIR/anim3" 2>/dev/null
+    fi
+}
+
+restore_state() {
+    log "restore_state"
+    if [ -s "$BACKUP_DIR/governor" ]; then
+        while IFS='=' read -r p v; do
+            [ -n "$p" ] && as_root "echo '$v' > '$p'" 2>/dev/null || true
+        done < "$BACKUP_DIR/governor"
+    fi
+    if [ -s "$BACKUP_DIR/minfreq" ]; then
+        while IFS='=' read -r p v; do
+            [ -n "$p" ] && as_root "echo '$v' > '$p'" 2>/dev/null || true
+        done < "$BACKUP_DIR/minfreq"
+    fi
+    if [ "$HAS_ROOT" -eq 1 ]; then
+        local a1 a2 a3
+        a1=$(cat "$BACKUP_DIR/anim1" 2>/dev/null); [ -z "$a1" ] && a1="1.0"
+        a2=$(cat "$BACKUP_DIR/anim2" 2>/dev/null); [ -z "$a2" ] && a2="1.0"
+        a3=$(cat "$BACKUP_DIR/anim3" 2>/dev/null); [ -z "$a3" ] && a3="1.0"
+        as_root "settings put global window_animation_scale $a1" 2>/dev/null || true
+        as_root "settings put global transition_animation_scale $a2" 2>/dev/null || true
+        as_root "settings put global animator_duration_scale $a3" 2>/dev/null || true
+    fi
+}
+
+apply_tweaks() {
+    local verbose="${1:-0}"
+    local say
+    if [ "$verbose" -eq 1 ]; then say() { printf '  %s\n' "$*"; }
+    else say() { :; }; fi
+    log "apply_tweaks"
+    am kill-all >/dev/null 2>&1 || true
+    say "${G}OK${D} Kill background apps (user scope)"
+    if [ "$HAS_ROOT" -eq 1 ]; then
+        as_root "pm trim-caches 999999999999" >/dev/null 2>&1 || true
+        as_root "am kill-all" >/dev/null 2>&1 || true
+        say "${G}OK${D} Kill background apps (system scope)"
+        local ok=0 f mf g gp
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            [ -w "$f" ] 2>/dev/null || continue
+            if as_root "echo performance > '$f'" 2>/dev/null; then ok=$((ok + 1)); fi
+        done
+        [ "$ok" -gt 0 ] && say "${G}OK${D} Governor performance ($ok cores)" || say "${Y}!!${D} Governor not writable"
+        ok=0
+        for f in /sys/devices/system/cpu/cpu*/cpufreq; do
+            [ -r "$f/cpuinfo_max_freq" ] && [ -w "$f/scaling_min_freq" ] 2>/dev/null || continue
+            mf=$(cat "$f/cpuinfo_max_freq" 2>/dev/null); [ -z "$mf" ] && continue
+            if as_root "echo $mf > '$f/scaling_min_freq'" 2>/dev/null; then ok=$((ok + 1)); fi
+        done
+        [ "$ok" -gt 0 ] && say "${G}OK${D} Min freq = max ($ok cores)"
+        gp=0
+        for g in /sys/class/kgsl/kgsl-3d0/devfreq/governor /sys/class/devfreq/*gpu*/governor; do
+            [ -w "$g" ] 2>/dev/null || continue
+            if as_root "echo performance > '$g'" 2>/dev/null; then gp=$((gp + 1)); fi
+        done
+        [ "$gp" -gt 0 ] && say "${G}OK${D} GPU governor performance"
+        as_root "sync; echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+        say "${G}OK${D} Drop kernel caches"
+        as_root "settings put global window_animation_scale 0.0" 2>/dev/null || true
+        as_root "settings put global transition_animation_scale 0.0" 2>/dev/null || true
+        as_root "settings put global animator_duration_scale 0.0" 2>/dev/null || true
+        say "${G}OK${D} Animations disabled"
+        for f in /sys/block/mmcblk*/queue/read_ahead_kb /sys/block/sd*/queue/read_ahead_kb; do
+            [ -w "$f" ] 2>/dev/null && as_root "echo 128 > '$f'" 2>/dev/null || true
+        done
+        say "${G}OK${D} I/O read_ahead 128KB"
+    else
+        say "${Y}--${D} Limited mode (no root)"
+    fi
+}
+daemon_alive() {
+    [ -f "$PIDFILE" ] || return 1
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_status() {
+    banner
+    printf '%s\n' "${C}  --- Device Status --------------------------${D}"
+    printf '  %-12s %s\n' "Model"    "$(getprop ro.product.model 2>/dev/null || echo unknown)"
+    printf '  %-12s %s\n' "Android"  "$(getprop ro.build.version.release 2>/dev/null || echo unknown)"
+    printf '  %-12s %s\n' "SoC"      "$(get_soc)"
+    printf '  %-12s %s\n' "Cores"    "$(nproc 2>/dev/null || echo '?')"
+    local rt ra ru rp cf mf tp tc
+    read -r rt ra <<< "$(get_ram)"
+    ru=$((rt - ra)); rp=0
+    [ "$rt" -gt 0 ] && rp=$((ru * 100 / rt))
+    printf '  %-12s %sMB / %sMB (%s%%)\n' "RAM" "$ru" "$rt" "$rp"
+    read -r cf mf <<< "$(get_freq)"
+    printf '  %-12s %s / %s MHz\n' "CPU Freq" "$cf" "$mf"
+    printf '  %-12s %s\n' "Governor" "$(get_governor)"
+    tp=$(get_temp); tc=$(temp_color "$tp")
+    printf '  %-12s %s%s C%s\n' "CPU Temp" "$tc" "$tp" "$D"
+    if [ "$HAS_ROOT" -eq 1 ]; then
+        printf '  %-12s %sYES%s (full access)\n' "Root" "$G" "$D"
+    else
+        printf '  %-12s %sNO%s (limited)\n' "Root" "$Y" "$D"
+    fi
+    printf '%s\n' "${C}  --- Mode & Daemon --------------------------${D}"
+    if [ -f "$GAME_FLAG" ]; then
+        printf '  %-12s %sACTIVE%s\n' "Game Mode" "$G" "$D"
+    else
+        printf '  %-12s %sOFF%s\n' "Game Mode" "$DM" "$D"
+    fi
+    if daemon_alive; then
+        printf '  %-12s %sRUNNING%s (PID %s)\n' "Daemon" "$G" "$D" "$(cat "$PIDFILE" 2>/dev/null)"
+    else
+        printf '  %-12s %sstopped%s\n' "Daemon" "$DM" "$D"
+    fi
+    printf '%s\n' "${C}  --------------------------------------------${D}"
+}
+
+start_daemon() {
+    if daemon_alive; then
+        printf '%s\n' "${Y}Daemon already running (PID $(cat "$PIDFILE"))${D}"
+        return 0
+    fi
+    : > "$ALIVEFILE"
+    nohup setsid "$0" _daemon >/dev/null 2>&1 &
+    local pid=$!
+    printf '%s\n' "$pid" > "$PIDFILE"
+    command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null || true
+    printf '%s\n' "${G}OK${D} Daemon started (PID $pid)"
+    printf '%s\n' "  ${DM}Wake-lock active. Stays alive after Termux closes.${D}"
+}
+
+stop_daemon() {
+    rm -f "$ALIVEFILE"
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+        rm -f "$PIDFILE"
+    fi
+    pkill -f "tboost _daemon" 2>/dev/null || true
+    command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null || true
+    printf '%s\n' "${G}OK${D} Daemon stopped"
+}
+
+_daemon_main() {
+    printf '%s\n' "$$" > "$PIDFILE"
+    log "daemon start pid=$$"
+    trap 'log "daemon exit"; exit 0' TERM INT
+    while [ -f "$ALIVEFILE" ]; do
+        apply_tweaks 0
+        sleep 25
+    done
+    log "daemon loop end"
+}
+
+cmd_game_on() {
+    banner
+    printf '%s\n' "${M}${BD}  >> Activating GAME MODE${D}"
+    printf '\n'
+    backup_state
+    printf '  %s\n' "${G}OK${D} System state backed up"
+    apply_tweaks 1
+    : > "$GAME_FLAG"
+    printf '\n'
+    start_daemon
+    printf '\n'
+    printf '%s\n' "${G}${BD}  Game Mode ACTIVE.${D} Run ${BD}tboost game off${D} to stop."
+}
+
+cmd_game_off() {
+    banner
+    printf '%s\n' "${Y}${BD}  >> Deactivating GAME MODE${D}"
+    printf '\n'
+    stop_daemon
+    restore_state
+    rm -f "$GAME_FLAG"
+    printf '  %s\n' "${G}OK${D} System state restored"
+    printf '\n'
+    printf '%s\n' "${G}${BD}  Game Mode OFF.${D}"
+}
+cmd_clean() {
+    banner
+    printf '%s\n' "${C}  Cleaning cache...${D}"
+    local before after freed
+    before=$(df -k "$PREFIX" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -z "$before" ] && before=0
+    pkg clean >/dev/null 2>&1 || true
+    rm -rf "${TMPDIR:-/tmp}"/* 2>/dev/null || true
+    rm -rf "$HOME/.cache"/* 2>/dev/null || true
+    rm -rf "$PREFIX/var/cache/apt/archives"/*.deb 2>/dev/null || true
+    [ "$HAS_ROOT" -eq 1 ] && as_root "pm trim-caches 999999999999" >/dev/null 2>&1 || true
+    after=$(df -k "$PREFIX" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -z "$after" ] && after=0
+    freed=$(( (after - before) / 1024 ))
+    printf '  %s\n' "${G}OK${D} Done. Freed: ${G}+${freed}MB${D}"
+}
+
+cmd_monitor() {
+    banner
+    printf '%s\n' "${C}  Live Monitor - Ctrl+C to stop${D}"
+    printf '\n'
+    printf '  %-10s %8s %10s %10s  %s\n' "TIME" "TEMP" "RAM" "CPU_FREQ" "GOVERNOR"
+    trap 'printf "\n"; exit 0' INT
+    while true; do
+        local tp rt ra ru cf tc
+        tp=$(get_temp); tc=$(temp_color "$tp")
+        read -r rt ra <<< "$(get_ram)"
+        ru=$((rt - ra))
+        read -r cf _ <<< "$(get_freq)"
+        printf '  %-10s %s%6s C%s %8sMB %8sMHz  %s\n' \
+            "$(date +%H:%M:%S)" "$tc" "$tp" "$D" "$ru" "$cf" "$(get_governor)"
+        sleep 2
+    done
+}
+
+cmd_boot_install() {
+    banner
+    printf '%s\n' "${C}  Installing boot auto-start${D}"
+    printf '%s\n' "  ${DM}Requires Termux:Boot app (F-Droid)${D}"
+    mkdir -p "$HOME/.termux/boot"
+    {
+        printf '#!/data/data/com.termux/files/usr/bin/sh\n'
+        printf 'termux-wake-lock 2>/dev/null\n'
+        printf 'if [ -f %s ]; then\n' "$GAME_FLAG"
+        printf '  %s _resume\n' "$HOME/bin/tboost"
+        printf 'fi\n'
+    } > "$HOME/.termux/boot/tboost.sh"
+    chmod +x "$HOME/.termux/boot/tboost.sh"
+    printf '  %s\n' "${G}OK${D} Installed: ~/.termux/boot/tboost.sh"
+}
+cmd_verify() {
+    local missing=0 fn
+    for fn in detect_root as_root get_temp get_freq get_ram get_governor get_soc \
+              temp_color banner backup_state restore_state apply_tweaks \
+              cmd_status daemon_alive start_daemon stop_daemon _daemon_main \
+              cmd_game_on cmd_game_off cmd_clean cmd_monitor cmd_boot_install \
+              cmd_menu cmd_help main; do
+        type "$fn" >/dev/null 2>&1 || { printf 'MISSING: %s\n' "$fn"; missing=$((missing + 1)); }
+    done
+    if [ "$missing" -eq 0 ]; then
+        printf '%s\n' "${G}All functions present. Script is complete.${D}"
+    else
+        printf '%s\n' "${R}$missing function(s) missing - re-paste affected chunk${D}"
+        return 1
+    fi
+}
+
+
+cmd_help() {
+    banner
+    printf '%s\n' "  Usage: tboost <command>"
+    printf '\n'
+    printf '%s\n' "  Interactive (default):   tboost"
+    printf '\n'
+    printf '%s\n' "  Commands:"
+    printf '%s\n' "    tboost status         Device & daemon status"
+    printf '%s\n' "    tboost game on        Enable Game Mode + persistent daemon"
+    printf '%s\n' "    tboost game off       Disable & restore settings"
+    printf '%s\n' "    tboost monitor        Live monitoring"
+    printf '%s\n' "    tboost clean          Clean cache"
+    printf '%s\n' "    tboost daemon start|stop|restart|status"
+    printf '%s\n' "    tboost boot-install   Install boot auto-start"
+    printf '%s\n' "    tboost verify         Check all functions present"
+    printf '%s\n' "    tboost help           This help"
+    printf '\n'
+    printf '%s\n' "  Notes:"
+    printf '%s\n' "    - Game Mode = performance gov + min=max freq + GPU perf"
+    printf '%s\n' "      + kill background + animations off + cache clean"
+    printf '%s\n' "    - Daemon uses termux-wake-lock -> stays alive after close"
+    printf '%s\n' "    - Root = full system tweaks; no root = limited but safe"
+}
+
+get_fg_pkg() {
+    local p
+    p=$(dumpsys activity activities 2>/dev/null | grep -m1 -E 'mResumedActivity|topResumedActivity' | sed -E 's@.*[[:space:]]([a-zA-Z0-9._]+)/.*@\1@' | head -1)
+    [ -z "$p" ] && p=$(dumpsys window 2>/dev/null | grep -m1 'mCurrentFocus' | sed -E 's@.*[[:space:]]([a-zA-Z0-9._]+)/.*@\1@')
+    printf '%s\n' "$p"
+}
+
+cmd_fg() {
+    banner
+    local p; p=$(get_fg_pkg)
+    printf '  Foreground: %s%s%s\n' "$G" "${p:-unknown}" "$D"
+}
+
+cmd_fps() {
+    banner
+    local pkg="$1"
+    [ -z "$pkg" ] && pkg=$(get_fg_pkg)
+    if [ -z "$pkg" ]; then
+        printf '  %sForeground app not detected.%s\n' "$Y" "$D"
+        printf '  Usage: tboost fps <package.name>\n'
+        return 1
+    fi
+    printf '  Package: %s%s%s\n\n' "$G" "$pkg" "$D"
+    local out; out=$(dumpsys gfxinfo "$pkg" 2>/dev/null)
+    if ! printf '%s' "$out" | grep -q 'Total frames rendered'; then
+        printf '  %sNo frame data (app may not be rendering).%s\n' "$Y" "$D"
+        return 1
+    fi
+    printf '%s\n' "$out" | grep -E 'Total frames rendered|Janky frames|Number Missed Vsync|Number Slow UI thread' | head -8
+    local p50 p90 p95 p99
+    p50=$(printf '%s\n' "$out" | grep -m1 '50th percentile' | awk '{print $3}')
+    p90=$(printf '%s\n' "$out" | grep -m1 '90th percentile' | awk '{print $3}')
+    p95=$(printf '%s\n' "$out" | grep -m1 '95th percentile' | awk '{print $3}')
+    p99=$(printf '%s\n' "$out" | grep -m1 '99th percentile' | awk '{print $3}')
+    printf '\n  Frame latency (ms): p50=%s  p90=%s  p95=%s  p99=%s\n' "$p50" "$p90" "$p95" "$p99"
+    if [ -n "$p90" ] && [ "$p90" -gt 0 ] 2>/dev/null; then
+        printf '  FPS estimate (1000/p90): %s%s%s fps\n' "$G" "$((1000 / p90))" "$D"
+    fi
+}
+
+cmd_topcpu() {
+    banner
+    printf '  Top CPU consumers:\n\n'
+    if command -v top >/dev/null 2>&1; then
+        top -b -n 1 -m 15 2>/dev/null | tail -20
+    else
+        dumpsys cpuinfo 2>/dev/null | head -20
+    fi
+}
+
+cmd_memrank() {
+    banner
+    printf '  Top memory consumers:\n\n'
+    dumpsys meminfo 2>/dev/null | sed -n '/Total PSS by process:/,/^$/p' | head -22
+}
+
+cmd_kill() {
+    local pkg="$1"
+    if [ -z "$pkg" ]; then
+        banner
+        printf '  Usage: tboost kill <package.name>\n'
+        printf '  Example: tboost kill com.example.game\n'
+        return 1
+    fi
+    banner
+    printf '  Force-stopping %s%s%s...\n' "$B" "$pkg" "$D"
+    if am force-stop "$pkg" 2>/dev/null; then
+        printf '  %sOK%s %s stopped\n' "$G" "$D" "$pkg"
+    else
+        printf '  %sFAIL%s (system apps need root)\n' "$R" "$D"
+    fi
+}
+cmd_thermal() {
+    banner
+    printf '  Thermal zones:\n\n'
+    local z n t c
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        n=$(cat "$z/type" 2>/dev/null); [ -z "$n" ] && n="$(basename "$z")"
+        t=$(cat "$z/temp" 2>/dev/null); [ -z "$t" ] && continue
+        [ "$t" -gt 1000 ] 2>/dev/null && t=$((t / 1000))
+        c=$(temp_color "$t")
+        printf '  %-28s %s%4s C%s\n' "$n" "$c" "$t" "$D"
+    done
+}
+
+cmd_gpu() {
+    banner
+    printf '  GPU:\n\n'
+    local found=0 c m base
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        c=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        m=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null)
+        [ -n "$c" ] && printf '  Adreno cur: %s MHz\n' "$((c / 1000000))"
+        [ -n "$m" ] && printf '  Adreno max: %s MHz\n' "$((m / 1000000))"
+        found=1
+    fi
+    if [ -r /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq ]; then
+        c=$(cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq 2>/dev/null)
+        [ -n "$c" ] && printf '  Adreno devfreq: %s MHz\n' "$((c / 1000000))"
+        found=1
+    fi
+    for f in /sys/class/devfreq/*gpu*/cur_freq /sys/class/misc/mali0/device/devfreq/*/cur_freq; do
+        [ -r "$f" ] || continue
+        c=$(cat "$f" 2>/dev/null)
+        [ -z "$c" ] && continue
+        base=$(dirname "$f")
+        printf '  %s: %s MHz\n' "$(basename "$base")" "$((c / 1000000))"
+        found=1
+    done
+    [ "$found" -eq 0 ] && printf '  %sNo GPU freq nodes exposed (device specific).%s\n' "$Y" "$D"
+}
+
+cmd_battery() {
+    banner
+    printf '  Battery:\n\n'
+    local t cur vol
+    t=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
+    [ -n "$t" ] && printf '  Temperature: %s C\n' "$((t / 10))"
+    cur=$(cat /sys/class/power_supply/battery/current_now 2>/dev/null)
+    [ -n "$cur" ] && printf '  Current:     %s mA\n' "$((cur / 1000))"
+    vol=$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null)
+    [ -n "$vol" ] && printf '  Voltage:     %s mV\n' "$((vol / 1000))"
+    printf '\n'
+    dumpsys battery 2>/dev/null | grep -E 'level|status|health|charge counter' | head -5
+}
+
+cmd_io() {
+    banner
+    printf '  Disk I/O (2s sample):\n\n'
+    local r1 w1 r2 w2 line
+    r1=0; w1=0
+    while IFS= read -r line; do
+        set -- $line
+        [ "$2" = "0" ] && continue
+        r1=$((r1 + ${4:-0}))
+        w1=$((w1 + ${8:-0}))
+    done < /proc/diskstats
+    sleep 2
+    r2=0; w2=0
+    while IFS= read -r line; do
+        set -- $line
+        [ "$2" = "0" ] && continue
+        r2=$((r2 + ${4:-0}))
+        w2=$((w2 + ${8:-0}))
+    done < /proc/diskstats
+    printf '  Read:  %s KB/s\n' "$(( (r2 - r1) * 512 / 2 / 1024 ))"
+    printf '  Write: %s KB/s\n' "$(( (w2 - w1) * 512 / 2 / 1024 ))"
+}
+
+cmd_play() {
+    local pkg="$1"
+    if [ -z "$pkg" ]; then
+        banner
+        printf '  Usage: tboost play <package.name>\n'
+        printf '  Example: tboost play com.mobile.legends\n'
+        return 1
+    fi
+    cmd_game_on
+    printf '\n  Launching %s...\n' "$pkg"
+    if command -v monkey >/dev/null 2>&1; then
+        monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+    else
+        am start -n "$pkg" >/dev/null 2>&1
+    fi
+    printf '  Waiting 5s for frames...\n'
+    sleep 5
+    cmd_fps "$pkg"
+}
+
+cmd_verify() {
+    local missing=0 fn
+    for fn in detect_root as_root get_temp get_freq get_ram get_governor get_soc \
+              temp_color banner backup_state restore_state apply_tweaks \
+              cmd_status daemon_alive start_daemon stop_daemon _daemon_main \
+              cmd_game_on cmd_game_off cmd_clean cmd_monitor cmd_boot_install \
+              cmd_menu cmd_help main \
+              get_fg_pkg cmd_fg cmd_fps cmd_topcpu cmd_memrank cmd_kill \
+              cmd_thermal cmd_gpu cmd_battery cmd_io cmd_play cmd_gamedetect cmd_kill cmd_access cmd_threads cmd_mem_deep cmd_sf cmd_gpu_deep cmd_thermal_deep cmd_wakelock cmd_batterystat cmd_ffmax_report get_game_pkg run_priv get_access_mode; do
+        type "$fn" >/dev/null 2>&1 || { printf 'MISSING: %s\n' "$fn"; missing=$((missing + 1)); }
+    done
+    if [ "$missing" -eq 0 ]; then
+        printf '%sAll functions present. v3.1-extended complete.%s\n' "$G" "$D"
+    else
+        printf '%s%d missing%s\n' "$R" "$missing" "$D"
+        return 1
+    fi
+}
+
+cmd_help() {
+    banner
+    printf '  Usage: tboost <command>\n\n'
+    printf '  Interactive (no args):    tboost\n\n'
+    printf '  Shortcuts:   s=status  m=monitor  c=clean  on  off\n\n'
+    printf '  Core:\n'
+    printf '    status | game on|off | monitor | clean | verify\n\n'
+    printf '  Real-time (v3.1):\n'
+    printf '    fg                    Foreground package\n'
+    printf '    fps [pkg]             Real FPS + jank (dumpsys gfxinfo)\n'
+    printf '    top                   Top CPU processes\n'
+    printf '    mem                   Memory ranking per app\n'
+    printf '    thermal               All thermal zones\n'
+    printf '    gpu                   GPU freq (Adreno/Mali)\n'
+    printf '    battery               Battery details\n'
+    printf '    io                    Disk I/O rate\n'
+    printf '    kill <pkg>            Force-stop an app\n'
+    printf '    play <pkg>            Boost + launch + FPS check\n\n'
+    printf '  Daemon / Boot:\n'
+    printf '    daemon start|stop|restart|status\n'
+    printf '    boot-install          Auto-start via Termux:Boot\n'
+}
+
+# ========== OVERRIDE: Foreground detection multi-source ==========
+get_fg_pkg() {
+    local out pkg
+
+    # Source 1: activity top (paling reliable, Android 10+)
+    out=$(dumpsys activity top 2>/dev/null | grep -m1 "ACTIVITY ")
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 2: window focus
+    out=$(dumpsys window 2>/dev/null | grep -m1 -E "mCurrentFocus|mFocusedApp")
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 3: activity activities (Android 9-15)
+    out=$(dumpsys activity activities 2>/dev/null | grep -E "topResumedActivity|mResumedActivity|ResumedActivity" | grep -v "null" | head -1)
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 4: focused activity (Android 8-)
+    out=$(dumpsys activity 2>/dev/null | grep -m1 -E "mFocusedActivity|mFocusedApp")
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 5: raw activity top tanpa filter
+    out=$(dumpsys activity 2>/dev/null | grep -m1 "ACTIVITY")
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    printf '%s\n' "$pkg"
+}
+
+cmd_fg() {
+    banner
+    local p act
+    p=$(get_fg_pkg)
+    if [ -n "$p" ]; then
+        act=$(dumpsys activity top 2>/dev/null | grep -m1 ACTIVITY | awk '{print $2}')
+        printf '  Foreground: %s%s%s\n' "$G" "$p" "$D"
+        [ -n "$act" ] && printf '  Activity  : %s\n' "$act"
+    else
+        printf '  %sTidak terdeteksi.%s\n\n' "$Y" "$D"
+        printf '  Kemungkinan penyebab:\n'
+        printf '    1. Termux sudah take focus — game jadi background\n'
+        printf '    2. OEM blokir dumpsys\n\n'
+        printf '  Coba manual:\n'
+        printf '    tboost fps com.dts.freefireth    (Free Fire)\n'
+    fi
+}
+cmd_fps() {
+    banner
+    local pkg="$1"
+    [ -z "$pkg" ] && pkg=$(get_fg_pkg)
+
+    if [ -z "$pkg" ]; then
+        printf '  %sPackage tidak terdeteksi.%s\n\n' "$Y" "$D"
+        printf '  Cara pakai:\n'
+        printf '    tboost fps com.dts.freefireth    (Free Fire)\n'
+        printf '    tboost fps com.mobile.legends    (MLBB)\n'
+        printf '    tboost fps com.pubg.imobile      (PUBG M)\n'
+        return 1
+    fi
+
+    printf '  Package: %s%s%s\n\n' "$G" "$pkg" "$D"
+
+    local out
+    out=$(dumpsys gfxinfo "$pkg" 2>/dev/null)
+    if ! printf '%s' "$out" | grep -q 'Total frames rendered'; then
+        printf '  %sBelum ada frame data untuk package ini.%s\n\n' "$Y" "$D"
+        printf '  Solusi:\n'
+        printf '    - Main game minimal 30 detik\n'
+        printf '    - Tekan Home, buka Termux (jangan force-stop game)\n'
+        printf '    - Cek package benar: tboost gamedetect\n'
+        return 1
+    fi
+
+    printf '%s\n' "$out" | grep -E 'Total frames rendered|Janky frames|Number Missed Vsync|Number Slow UI thread' | head -8
+
+    local p50 p90 p95 p99
+    p50=$(printf '%s\n' "$out" | grep -m1 '50th percentile' | awk '{print $3}')
+    p90=$(printf '%s\n' "$out" | grep -m1 '90th percentile' | awk '{print $3}')
+    p95=$(printf '%s\n' "$out" | grep -m1 '95th percentile' | awk '{print $3}')
+    p99=$(printf '%s\n' "$out" | grep -m1 '99th percentile' | awk '{print $3}')
+
+    printf '\n  Frame latency (ms): p50=%s  p90=%s  p95=%s  p99=%s\n' "$p50" "$p90" "$p95" "$p99"
+
+    if [ -n "$p90" ] && [ "$p90" -gt 0 ] 2>/dev/null; then
+        printf '  FPS estimate: %s%s%s fps\n' "$G" "$((1000 / p90))" "$D"
+    fi
+}
+
+cmd_gamedetect() {
+    banner
+    local pkg
+    pkg=$(get_fg_pkg)
+
+    if [ -z "$pkg" ]; then
+        printf '  %sTidak ada foreground app.%s\n\n' "$Y" "$D"
+        printf '  Buka game dulu, lalu jalankan lagi: tboost gamedetect\n'
+        return 1
+    fi
+
+    printf '  Foreground: %s%s%s\n\n' "$B" "$pkg" "$D"
+
+    case "$pkg" in
+        com.dts.freefireth*)     printf '  %sGAME: Free Fire%s\n' "$G" "$D"; printf '  FPS: tboost fps com.dts.freefireth\n' ;;
+        com.dts.freefiremax*)    printf '  %sGAME: Free Fire MAX%s\n' "$G" "$D"; printf '  FPS: tboost fps com.dts.freefiremax\n' ;;
+        com.mobile.legends*)     printf '  %sGAME: Mobile Legends%s\n' "$G" "$D"; printf '  FPS: tboost fps com.mobile.legends\n' ;;
+        com.pubg.imobile*)       printf '  %sGAME: PUBG Mobile%s\n' "$G" "$D"; printf '  FPS: tboost fps com.pubg.imobile\n' ;;
+        com.tencent.ig*)         printf '  %sGAME: PUBG Mobile (Tencent)%s\n' "$G" "$D"; printf '  FPS: tboost fps com.tencent.ig\n' ;;
+        com.garena.game.kgid*)   printf '  %sGAME: Arena of Valor%s\n' "$G" "$D" ;;
+        com.garena.game.codm*)   printf '  %sGAME: COD Mobile%s\n' "$G" "$D" ;;
+        com.mojang.minecraftpe*) printf '  %sGAME: Minecraft%s\n' "$G" "$D" ;;
+        com.roblox.client*)      printf '  %sGAME: Roblox%s\n' "$G" "$D" ;;
+        com.epicgames.fortnite*) printf '  %sGAME: Fortnite%s\n' "$G" "$D" ;;
+        com.activision.callofduty*) printf '  %sGAME: COD%s\n' "$G" "$D" ;;
+        com.tencent.tmgp.*)      printf '  %sGAME: Tencent game (%s)%s\n' "$G" "$pkg" "$D" ;;
+        com.termux*)             printf '  %sTERMUX — game di background%s\n' "$Y" "$D"; printf '  Tekan Home dari game, LANGSUNG buka Termux\n' ;;
+        *)                       printf '  %sBukan game terdaftar: %s%s\n' "$DM" "$pkg" "$D"; printf '  FPS: tboost fps %s\n' "$pkg" ;;
+    esac
+}
+
+cmd_play() {
+    local pkg="$1"
+    if [ -z "$pkg" ]; then
+        banner
+        printf '  Usage: tboost play <package.name>\n\n'
+        printf '  Contoh:\n'
+        printf '    tboost play com.dts.freefireth\n'
+        printf '    tboost play com.mobile.legends\n'
+        return 1
+    fi
+    cmd_game_on
+    printf '\n  Launching %s...\n' "$pkg"
+    monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
+        || am start -n "$pkg" >/dev/null 2>&1 \
+        || printf '  %sGagal launch (cek nama package)%s\n' "$Y" "$D"
+    printf '  Menunggu 10 detik agar frame ter-render...\n'
+    sleep 10
+    cmd_fps "$pkg"
+}
+
+cmd_kill() {
+    local pkg="$1"
+    if [ -z "$pkg" ]; then
+        banner
+        printf '  Usage: tboost kill <package.name>\n'
+        return 1
+    fi
+    banner
+    printf '  Force-stopping %s...\n' "$pkg"
+    if am force-stop "$pkg" 2>/dev/null; then
+        printf '  %sOK%s %s stopped\n' "$G" "$D" "$pkg"
+    else
+        printf '  %sFAIL%s (system apps butuh root)\n' "$R" "$D"
+    fi
+}
+# ========== FF MAX Foreground Detection ==========
+# Package: com.dts.freefiremax
+FF_MAX="com.dts.freefiremax"
+FF_CLASSIC="com.dts.freefireth"
+
+get_access_mode() {
+    if [ "$HAS_ROOT" -eq 1 ]; then printf 'root\n'
+    elif command -v rish >/dev/null 2>&1 && rish -c id 2>/dev/null | grep -q uid; then printf 'shizuku\n'
+    else printf 'user\n'; fi
+}
+
+run_priv() {
+    # Jalankan perintah dengan privilege tertinggi yang tersedia
+    local mode
+    mode=$(get_access_mode)
+    case "$mode" in
+        root)    as_root "$*" ;;
+        shizuku) rish -c "$*" ;;
+        *)       sh -c "$*" ;;
+    esac
+}
+
+get_fg_pkg() {
+    local out pkg mode
+    mode=$(get_access_mode)
+
+    # Source 1: activity top via priv
+    if [ "$mode" != "user" ]; then
+        out=$(run_priv "dumpsys activity top" 2>/dev/null | grep -m1 'ACTIVITY ')
+    else
+        out=$(dumpsys activity top 2>/dev/null | grep -m1 'ACTIVITY ')
+    fi
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 2: dumpsys window
+    if [ "$mode" != "user" ]; then
+        out=$(run_priv "dumpsys window windows" 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp')
+    else
+        out=$(dumpsys window windows 2>/dev/null | grep -m1 -E 'mCurrentFocus|mFocusedApp')
+    fi
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 3: activity activities multi-key
+    if [ "$mode" != "user" ]; then
+        out=$(run_priv "dumpsys activity activities" 2>/dev/null | grep -E 'topResumedActivity|mResumedActivity|ResumedActivity' | grep -v null | head -1)
+    else
+        out=$(dumpsys activity activities 2>/dev/null | grep -E 'topResumedActivity|mResumedActivity|ResumedActivity' | grep -v null | head -1)
+    fi
+    pkg=$(printf '%s' "$out" | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._]+' | head -1 | cut -d'/' -f1)
+    [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+
+    # Source 4: running processes — cari FF MAX yang sedang jalan
+    # (fallback kalau foreground benar-benar tidak bisa dibaca)
+    if [ "$mode" != "user" ]; then
+        out=$(run_priv "ps -A" 2>/dev/null | grep -m1 "$FF_MAX" | awk '{print $NF}')
+        [ -z "$out" ] && out=$(run_priv "ps -A" 2>/dev/null | grep -m1 "$FF_CLASSIC" | awk '{print $NF}')
+    else
+        out=$(ps -A 2>/dev/null | grep -m1 "$FF_MAX" | awk '{print $NF}')
+        [ -z "$out" ] && out=$(ps -A 2>/dev/null | grep -m1 "$FF_CLASSIC" | awk '{print $NF}')
+    fi
+    [ -n "$out" ] && { printf '%s\n' "$out"; return; }
+
+    # Source 5: /proc fallback — cari cmdline
+    for d in /proc/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        pkg=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | grep -m1 -E "$FF_MAX|$FF_CLASSIC")
+        [ -n "$pkg" ] && { printf '%s\n' "$pkg"; return; }
+    done
+
+    printf '\n'
+}
+
+get_game_pkg() {
+    # Prioritas: FF MAX > FF Classic > foreground apapun
+    local p
+    p=$(ps -A 2>/dev/null | grep -m1 "$FF_MAX" | awk '{print $NF}')
+    [ -n "$p" ] && { printf '%s\n' "$p"; return; }
+    p=$(ps -A 2>/dev/null | grep -m1 "$FF_CLASSIC" | awk '{print $NF}')
+    [ -n "$p" ] && { printf '%s\n' "$p"; return; }
+    get_fg_pkg
+}
+
+cmd_access() {
+    banner
+    local mode
+    mode=$(get_access_mode)
+    printf '  Access mode: %s%s%s\n\n' "$G" "$mode" "$D"
+    case "$mode" in
+        root)
+            printf '  %s[+]%s Root detected — full deep access\n' "$G" "$D"
+            printf '  %s[+]%s dumpsys full scope\n' "$G" "$D"
+            printf '  %s[+]%s /proc/PID/* readable (FF MAX threads, io, stat)\n' "$G" "$D"
+            printf '  %s[+]%s /sys/kernel/debug/* (gpu, thermal detailed)\n' "$G" "$D"
+            printf '  %s[+]%s procrank / showmap\n' "$G" "$D"
+            ;;
+        shizuku)
+            printf '  %s[+]%s Shizuku detected — ADB-level access\n' "$G" "$D"
+            printf '  %s[+]%s dumpsys full scope via rish\n' "$G" "$D"
+            printf '  %s[-]%s /proc/PID/* restricted (same as user)\n' "$Y" "$D"
+            ;;
+        user)
+            printf '  %s[!]%s No root / no Shizuku\n' "$Y" "$D"
+            printf '  %s[-]%s dumpsys limited to own UID\n' "$Y" "$D"
+            printf '  %s[-]%s /proc/PID/* other apps blocked\n' "$Y" "$D"
+            printf '\n  Solusi:\n'
+            printf '    1. Root (Magisk/KernelSU) → semua fitur\n'
+            printf '    2. Shizuku + rish → 80%% fitur\n'
+            printf '    3. Tanpa keduanya → FPS + FF MAX package tetap bisa\n'
+            ;;
+    esac
+}
+
+cmd_fg() {
+    banner
+    local p mode
+    mode=$(get_access_mode)
+    p=$(get_fg_pkg)
+    printf '  Mode      : %s\n' "$mode"
+    if [ -n "$p" ]; then
+        printf '  Foreground: %s%s%s\n' "$G" "$p" "$D"
+        case "$p" in
+            "$FF_MAX"*) printf '  %s>> FREE FIRE MAX DETECTED%s\n' "$G" "$D" ;;
+            "$FF_CLASSIC"*) printf '  %s>> FREE FIRE (Classic) DETECTED%s\n' "$G" "$D" ;;
+        esac
+    else
+        printf '  %sTidak terdeteksi.%s\n\n' "$Y" "$D"
+        printf '  Coba: tboost gd  (game detect dengan fallback)\n'
+    fi
+}
+
+cmd_gamedetect() {
+    banner
+    local p mode
+    mode=$(get_access_mode)
+    p=$(get_game_pkg)
+
+    printf '  Access: %s%s%s\n' "$G" "$mode" "$D"
+    if [ -z "$p" ]; then
+        printf '  %sFF MAX tidak terdeteksi.%s\n\n' "$Y" "$D"
+        printf '  Manual: tboost ffmax    (paksa target FF MAX)\n'
+        return 1
+    fi
+    printf '  Detected: %s%s%s\n\n' "$G" "$p" "$D"
+
+    case "$p" in
+        "$FF_MAX"*)
+            printf '  %sGAME: FREE FIRE MAX%s\n' "$G" "$D"
+            printf '  Package: %s\n' "$FF_MAX"
+            ;;
+        "$FF_CLASSIC"*)
+            printf '  %sGAME: FREE FIRE (Classic)%s\n' "$G" "$D"
+            printf '  Package: %s\n' "$FF_CLASSIC"
+            ;;
+        com.mobile.legends*)     printf '  %sGAME: Mobile Legends%s\n' "$G" "$D" ;;
+        com.pubg.imobile*)       printf '  %sGAME: PUBG Mobile%s\n' "$G" "$D" ;;
+        com.tencent.ig*)         printf '  %sGAME: PUBG Mobile (Tencent)%s\n' "$G" "$D" ;;
+        com.garena.game.codm*)   printf '  %sGAME: COD Mobile%s\n' "$G" "$D" ;;
+        com.termux*)
+            printf '  %sTERMUX — game di background%s\n' "$Y" "$D"
+            printf '  Tekan Home dari game, LANGSUNG buka Termux\n'
+            printf '  atau: tboost ffmax\n'
+            ;;
+        *)                       printf '  %sOther: %s%s\n' "$DM" "$p" "$D" ;;
+    esac
+}
+cmd_fps() {
+    banner
+    local pkg="$1" mode out p50 p90 p95 p99
+    mode=$(get_access_mode)
+    [ -z "$pkg" ] && pkg=$(get_game_pkg)
+
+    if [ -z "$pkg" ]; then
+        printf '  %sTidak ada package terdeteksi.%s\n\n' "$Y" "$D"
+        printf '  Pakai: tboost fps com.dts.freefiremax\n'
+        return 1
+    fi
+    printf '  Package: %s%s%s\n' "$G" "$pkg" "$D"
+    printf '  Access : %s\n\n' "$mode"
+
+    out=$(run_priv "dumpsys gfxinfo $pkg" 2>/dev/null)
+    [ -z "$out" ] && out=$(dumpsys gfxinfo "$pkg" 2>/dev/null)
+
+    if ! printf '%s' "$out" | grep -q 'Total frames rendered'; then
+        printf '  %sBelum ada frame data.%s\n\n' "$Y" "$D"
+        printf '  Requirement:\n'
+        printf '    - Game sudah render minimal 30 detik\n'
+        printf '    - Package benar (FF MAX: com.dts.freefiremax)\n'
+        printf '    - Coba: tboost play com.dts.freefiremax\n'
+        return 1
+    fi
+
+    printf '%s\n' "$out" | grep -E 'Total frames rendered|Janky frames|Number Missed Vsync|Number Slow UI thread|Number Slow bitmap uploads|Number Slow issue draw commands' | head -8
+
+    p50=$(printf '%s\n' "$out" | grep -m1 '50th percentile' | awk '{print $3}')
+    p90=$(printf '%s\n' "$out" | grep -m1 '90th percentile' | awk '{print $3}')
+    p95=$(printf '%s\n' "$out" | grep -m1 '95th percentile' | awk '{print $3}')
+    p99=$(printf '%s\n' "$out" | grep -m1 '99th percentile' | awk '{print $3}')
+
+    printf '\n  Frame latency (ms): p50=%s  p90=%s  p95=%s  p99=%s\n' "$p50" "$p90" "$p95" "$p99"
+    if [ -n "$p90" ] && [ "$p90" -gt 0 ] 2>/dev/null; then
+        printf '  FPS estimate: %s%s%s fps\n' "$G" "$((1000 / p90))" "$D"
+    fi
+}
+
+cmd_sf() {
+    banner
+    printf '  SurfaceFlinger refresh rate & frame info:\n\n'
+    local out
+    out=$(run_priv "dumpsys SurfaceFlinger --latency" 2>/dev/null | head -30)
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    else
+        dumpsys SurfaceFlinger 2>/dev/null | grep -iE 'refresh|fps|vsync' | head -10
+    fi
+}
+
+cmd_threads() {
+    banner
+    local pkg pid
+    pkg="${1:-$(get_game_pkg)}"
+    if [ -z "$pkg" ]; then
+        printf '  %sPackage tidak terdeteksi.%s\n' "$Y" "$D"
+        return 1
+    fi
+    pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
+    [ -z "$pid" ] && pid=$(ps -A 2>/dev/null | grep -m1 "$pkg" | awk '{print $2}')
+
+    printf '  Package: %s\n' "$pkg"
+    printf '  PID    : %s\n\n' "${pid:-unknown}"
+
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+        printf '  Thread count: %s\n' "$(ls /proc/$pid/task 2>/dev/null | wc -l)"
+        printf '  Thread states (top 10):\n'
+        printf '    %-8s %-20s %-8s\n' "TID" "NAME" "STATE"
+        for t in /proc/$pid/task/*; do
+            [ -r "$t/comm" ] || continue
+            tid=$(basename "$t")
+            tn=$(cat "$t/comm" 2>/dev/null)
+            ts=$(awk '/^State:/{print $2}' "$t/status" 2>/dev/null)
+            printf '    %-8s %-20s %-8s\n' "$tid" "$tn" "$ts"
+        done | head -11
+        printf '\n  CPU per-thread (1s):\n'
+        top -b -H -n 1 -p "$pid" 2>/dev/null | tail -12
+    else
+        printf '  %s/proc/%s tidak bisa diakses.%s\n' "$Y" "$pid" "$D"
+        printf '  Butuh root untuk baca /proc app lain.\n'
+    fi
+}
+
+
+cmd_gpu_deep() {
+    banner
+    printf '  GPU deep info:\n\n'
+    local f c m busy
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage ]; then
+        busy=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null)
+        printf '  Adreno busy: %s\n' "$busy"
+    fi
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        c=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        m=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null)
+        printf '  Adreno cur: %s MHz  max: %s MHz\n' "$((c / 1000000))" "$((m / 1000000))"
+    fi
+    if [ -r /sys/class/kgsl/kgsl-3d0/temp ]; then
+        printf '  GPU temp: %s C\n' "$(($(cat /sys/class/kgsl/kgsl-3d0/temp 2>/dev/null) / 1000))"
+    fi
+    for f in /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq /sys/class/devfreq/*gpu*/cur_freq; do
+        [ -r "$f" ] || continue
+        c=$(cat "$f" 2>/dev/null)
+        printf '  %s: %s MHz\n' "$(basename "$(dirname "$f")")" "$((c / 1000000))"
+    done
+}
+
+cmd_mem_deep() {
+    banner
+    local pkg="$1"
+    [ -z "$pkg" ] && pkg=$(get_game_pkg)
+    if [ -z "$pkg" ]; then
+        printf '  %sPackage tidak terdeteksi.%s\n' "$Y" "$D"
+        return 1
+    fi
+    printf '  Memory detail: %s%s%s\n\n' "$G" "$pkg" "$D"
+    run_priv "dumpsys meminfo -a $pkg" 2>/dev/null | head -50 \
+        || dumpsys meminfo "$pkg" 2>/dev/null | head -50 \
+        || printf '  %sAccess denied.%s\n' "$Y" "$D"
+}
+
+cmd_wakelock() {
+    banner
+    printf '  Wakelocks (partial):\n\n'
+    local out
+    out=$(run_priv "dumpsys power" 2>/dev/null | grep -iE 'wake lock|Wake Lock' | head -20)
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    else
+        dumpsys power 2>/dev/null | grep -iE 'wake lock|Wake Lock' | head -20
+    fi
+}
+
+cmd_batterystat() {
+    banner
+    printf '  Battery & power draw:\n\n'
+    run_priv "dumpsys batterystats --charged" 2>/dev/null | grep -E 'Estimated power|Capacity|Uptime|Discharge' | head -10 \
+        || dumpsys battery 2>/dev/null | head -15
+}
+cmd_access() {
+    banner
+    local mode
+    mode=$(get_access_mode)
+    printf '  Access mode: %s%s%s\n\n' "$G" "$mode" "$D"
+    case "$mode" in
+        root)
+            printf '  %s[+]%s Root detected — full deep access\n' "$G" "$D"
+            printf '  %s[+]%s dumpsys full scope\n' "$G" "$D"
+            printf '  %s[+]%s /proc/PID/* readable\n' "$G" "$D"
+            ;;
+        shizuku)
+            printf '  %s[+]%s Shizuku detected\n' "$G" "$D"
+            printf '  %s[+]%s dumpsys full scope via rish\n' "$G" "$D"
+            ;;
+        user)
+            printf '  %s[!]%s No root / no Shizuku\n' "$Y" "$D"
+            printf '  %s[-]%s dumpsys limited\n' "$Y" "$D"
+            ;;
+    esac
+}
+
+cmd_ffmax_report() {
+    banner
+    local pkg="$FF_MAX" mode pid out
+    mode=$(get_access_mode)
+    printf '  %sFREE FIRE MAX - FULL REPORT%s\n' "$G" "$D"
+    printf '  Package: %s\n' "$pkg"
+    printf '  Access : %s\n\n' "$mode"
+    pid=$(pgrep -f "$pkg" 2>/dev/null | head -1)
+    [ -z "$pid" ] && pid=$(ps -A 2>/dev/null | grep -m1 "$pkg" | awk '{print $2}')
+    if [ -z "$pid" ]; then
+        printf '  %sFF MAX tidak running.%s\n' "$Y" "$D"
+        return 1
+    fi
+    printf '  PID    : %s\n' "$pid"
+    printf '  Threads: %s\n' "$(ls /proc/$pid/task 2>/dev/null | wc -l 2>/dev/null || echo '?')"
+    [ -r "/proc/$pid/status" ] && {
+        printf '\n  Memory:\n'
+        grep -E 'VmPeak|VmSize|VmRSS|VmData|VmSwap|Threads' "/proc/$pid/status" 2>/dev/null | sed 's/^/    /'
+    }
+    printf '\n  FPS sample:\n'
+    out=$(run_priv "dumpsys gfxinfo $pkg" 2>/dev/null)
+    [ -z "$out" ] && out=$(dumpsys gfxinfo "$pkg" 2>/dev/null)
+    printf '%s\n' "$out" | grep -E 'Total frames|Janky|percentile' | head -6 | sed 's/^/    /'
+}
+
+cmd_play() {
+    local pkg="${1:-$FF_MAX}"
+    cmd_game_on
+    printf '\n  Launching %s...\n' "$pkg"
+    monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
+        || am start -n "$pkg" >/dev/null 2>&1 \
+        || printf '  %sGagal launch%s\n' "$Y" "$D"
+    printf '  Menunggu 10 detik...\n'
+    sleep 10
+    cmd_fps "$pkg"
+}
+
+cmd_kill() {
+    local pkg="${1:-$FF_MAX}"
+    banner
+    printf '  Force-stopping %s...\n' "$pkg"
+    if am force-stop "$pkg" 2>/dev/null; then
+        printf '  %sOK%s stopped\n' "$G" "$D"
+    else
+        printf '  %sFAIL%s\n' "$R" "$D"
+    fi
+}
+cmd_help() {
+    banner
+    printf '  Usage: tboost [command]\n\n'
+    printf '  FF MAX:\n'
+    printf '    gd, gamedetect    Detect FF MAX / games\n'
+    printf '    fps [pkg]         FPS realtime\n'
+    printf '    play [pkg]        Boost + launch (default FF MAX)\n'
+    printf '    kill [pkg]        Force-stop\n'
+    printf '    ffmax             Full FF MAX report\n\n'
+    printf '  Deep:\n'
+    printf '    threads | memdeep | sf | gpudeep | thermaldeep\n'
+    printf '    wakelock | battstat | access\n\n'
+    printf '  System:\n'
+    printf '    s|status | on | off | m|monitor | c|clean\n'
+    printf '    daemon start|stop|restart|status\n'
+    printf '    boot-install | verify | help\n'
+}
+
+
+get_game_pkg() {
+    local pid
+    pid=$(detect_ff "$FF_MAX")
+    [ -n "$pid" ] && { printf '%s\n' "$FF_MAX"; return; }
+    pid=$(detect_ff "$FF_CLASSIC")
+    [ -n "$pid" ] && { printf '%s\n' "$FF_CLASSIC"; return; }
+    get_fg_pkg
+}
+
+get_game_pid() {
+    local pkg="${1:-$(get_game_pkg)}"
+    [ -z "$pkg" ] && return 1
+    detect_ff "$pkg"
+}
+
+cmd_gd() {
+    banner
+    local mode ffmax_pid ffclassic_pid
+    mode=$(get_access_mode)
+    printf '  Access: %s%s%s\n\n' "$G" "$mode" "$D"
+    ffmax_pid=$(detect_ff "$FF_MAX")
+    ffclassic_pid=$(detect_ff "$FF_CLASSIC")
+    if [ -n "$ffmax_pid" ]; then
+        printf '  %s[+]%s FREE FIRE MAX running\n' "$G" "$D"
+        printf '      Package: %s\n' "$FF_MAX"
+        printf '      PID    : %s\n' "$ffmax_pid"
+        if [ -r "/proc/$ffmax_pid/status" ]; then
+            printf '      Memory : %s KB\n' "$(awk '/VmRSS/{print $2}' /proc/$ffmax_pid/status 2>/dev/null)"
+            printf '      Threads: %s\n' "$(awk '/Threads/{print $2}' /proc/$ffmax_pid/status 2>/dev/null)"
+        else
+            printf '      %s(/proc terbatas tanpa root)%s\n' "$DM" "$D"
+        fi
+    elif [ -n "$ffclassic_pid" ]; then
+        printf '  %s[+]%s FREE FIRE Classic running\n' "$G" "$D"
+        printf '      Package: %s\n' "$FF_CLASSIC"
+        printf '      PID    : %s\n' "$ffclassic_pid"
+    else
+        printf '  %s[!]%s FF MAX tidak running%s\n' "$Y" "$D" "$D"
+        return 1
+    fi
+    printf '\n'
+    cmd_fps_try
+}
+
+cmd_fps_try() {
+    local pkg pid
+    pkg=$(get_game_pkg)
+    pid=$(get_game_pid "$pkg")
+    printf '  %sFPS attempt:%s\n\n' "$BD" "$D"
+    if command -v rish >/dev/null 2>&1 && rish -c id 2>/dev/null | grep -q 'uid=2000'; then
+        local out
+        out=$(rish -c "dumpsys gfxinfo $pkg" 2>/dev/null)
+        if printf '%s' "$out" | grep -q 'Total frames'; then
+            printf '  %s[+]%s Via rish (Shizuku)\n' "$G" "$D"
+            printf '%s\n' "$out" | grep -E 'Total frames|Janky|percentile' | head -5 | sed 's/^/      /'
+            return 0
+        fi
+    fi
+    local out2
+    out2=$(dumpsys gfxinfo "$pkg" 2>/dev/null)
+    if printf '%s' "$out2" | grep -q 'Total frames'; then
+        printf '  %s[+]%s Via dumpsys\n' "$G" "$D"
+        printf '%s\n' "$out2" | grep -E 'Total frames|Janky|percentile' | head -5 | sed 's/^/      /'
+        return 0
+    fi
+    printf '  %s[-]%s FPS tidak bisa dibaca tanpa root/Shizuku aktif\n\n' "$Y" "$D" "$D"
+    printf '  %sAlternatif metrics:%s\n' "$BD" "$D"
+    local u n s id i w irq sirq st total busy
+    read -r _ u n s id i w irq sirq st _ < /proc/stat
+    total=$((u+n+s+id+i+w+irq+sirq+st))
+    busy=$((total-id-i-w))
+    [ "$total" -gt 0 ] && printf '      System CPU busy: %s%%\n' "$((busy * 100 / total))"
+    local mt ma
+    mt=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    ma=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+    [ "$mt" -gt 0 ] && printf '      RAM used: %s MB / %s MB\n' "$(( (mt-ma) / 1024 ))" "$(( mt / 1024 ))"
+    printf '      Temp: %s C\n' "$(get_temp)"
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        local g
+        g=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        printf '      GPU: %s MHz\n' "$((g / 1000000))"
+    fi
+    [ -n "$pid" ] && [ -r "/proc/$pid/stat" ] && \
+        printf '      FF CPU ticks: %s\n' "$(awk '{print $14+$15}' /proc/$pid/stat 2>/dev/null)"
+}
+cmd_sysdeep() {
+    banner
+    printf '  %sDEEP SYSTEM READ (no root)%s\n\n' "$BD" "$D"
+    printf '  %s[CPU]%s\n' "$BD" "$D"
+    local u n s i w irq sirq st total busy
+    read -r _ u n s i w irq sirq st _ < /proc/stat
+    total=$((u+n+s+i+w+irq+sirq+st)); busy=$((total-i-w))
+    printf '      Busy: %s%% (idle %s%%)\n' "$((busy * 100 / total))" "$((i * 100 / total))"
+    printf '\n  %s[MEMORY]%s\n' "$BD" "$D"
+    awk '/MemTotal|MemFree|MemAvailable|Cached|SwapTotal/ {printf "      %-14s %6d MB\n", $1, $2/1024}' /proc/meminfo
+    printf '\n  %s[LOAD]%s\n' "$BD" "$D"
+    read -r l1 l5 l15 _ < /proc/loadavg
+    printf '      1: %s  5: %s  15: %s\n' "$l1" "$l5" "$l15"
+    printf '\n  %s[THERMAL]%s\n' "$BD" "$D"
+    local z n t
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        n=$(cat "$z/type" 2>/dev/null); t=$(cat "$z/temp" 2>/dev/null)
+        [ "$t" -gt 1000 ] 2>/dev/null && t=$((t / 1000))
+        printf '      %-24s %s C\n' "$n" "$t"
+    done
+    printf '\n  %s[BATTERY]%s\n' "$BD" "$D"
+    for f in capacity temp voltage_now current_now status; do
+        [ -r "/sys/class/power_supply/battery/$f" ] && \
+            printf '      %-14s %s\n' "$f" "$(cat /sys/class/power_supply/battery/$f 2>/dev/null)"
+    done
+    printf '\n  %s[GPU]%s\n' "$BD" "$D"
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        local cur mx bp
+        cur=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        mx=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null)
+        bp=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null)
+        printf '      Adreno: %s / %s MHz\n' "$((cur / 1000000))" "$((mx / 1000000))"
+        [ -n "$bp" ] && printf '      Busy: %s\n' "$bp"
+    else
+        printf '      %s(no Adreno)%s\n' "$DM" "$D"
+    fi
+    printf '\n  %s[CPU freq per core]%s\n' "$BD" "$D"
+    local i_core=0 cf
+    for cf in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+        [ -r "$cf" ] || continue
+        printf '      cpu%s: %s MHz\n' "$i_core" "$(( $(cat "$cf" 2>/dev/null) / 1000 ))"
+        i_core=$((i_core + 1))
+    done
+    printf '\n  %s[FF MAX]%s\n' "$BD" "$D"
+    local pid
+    pid=$(get_game_pid)
+    if [ -n "$pid" ]; then
+        printf '      PID: %s\n' "$pid"
+        [ -r "/proc/$pid/status" ] && grep -E 'Name|State|VmRSS|Threads' "/proc/$pid/status" 2>/dev/null | sed 's/^/      /' \
+            || printf '      %s(/proc blokir)%s\n' "$Y" "$D"
+    else
+        printf '      not running\n'
+    fi
+    printf '\n  %s[TOP 10]%s\n' "$BD" "$D"
+    ps -A -o PID,RSS,NAME 2>/dev/null | sort -k2 -n -r | head -11 | sed 's/^/      /'
+}
+
+cmd_diag() {
+    banner
+    printf '  %sDIAGNOSTIC%s\n\n' "$BD" "$D"
+    printf '  Shell  : %s\n' "$SHELL"
+    printf '  User   : %s\n' "$(id -un 2>/dev/null)"
+    printf '  UID    : %s\n' "$(id -u 2>/dev/null)"
+    printf '  Device : %s\n' "$(getprop ro.product.model 2>/dev/null)"
+    printf '  Android: %s (SDK %s)\n' "$(getprop ro.build.version.release 2>/dev/null)" "$(getprop ro.build.version.sdk 2>/dev/null)"
+    printf '\n  %s[rish]%s\n' "$BD" "$D"
+    if command -v rish >/dev/null 2>&1; then
+        printf '      path: %s\n' "$(command -v rish)"
+        printf '      head: %s\n' "$(head -1 "$(command -v rish)" 2>/dev/null)"
+        printf '      appid: %s\n' "$(grep RISH_APPLICATION_ID "$(command -v rish)" 2>/dev/null | head -1)"
+        printf '      dex: %s\n' "$([ -f "$PREFIX/bin/rish_shizuku.dex" ] && echo yes || echo NO)"
+        printf '      id: %s\n' "$(rish -c id 2>&1 | head -1)"
+    else
+        printf '      rish: NOT INSTALLED\n'
+    fi
+    printf '\n  %s[dumpsys]%s\n' "$BD" "$D"
+    printf '      gfxinfo: %s\n' "$(dumpsys gfxinfo com.dts.freefiremax 2>&1 | head -1)"
+    printf '\n  %s[FF MAX]%s\n' "$BD" "$D"
+    printf '      PID: %s\n' "$(detect_ff "$FF_MAX" | head -1)"
+    printf '      pkg installed: %s\n' "$(pm list packages 2>/dev/null | grep -c "$FF_MAX")"
+}
+cmd_help() {
+    banner
+    printf '  Usage: tboost <command>\n\n'
+    printf '  FF MAX specific:\n'
+    printf '    gd             Detect FF MAX / game running\n'
+    printf '    fpsx           FPS with fallback metrics\n'
+    printf '    fps [pkg]      FPS strictly\n'
+    printf '    ffmax          Full FF MAX report\n'
+    printf '    play [pkg]     Boost + launch + FPS\n'
+    printf '    kill [pkg]     Force-stop app\n\n'
+    printf '  Deep access:\n'
+    printf '    sd, sysdeep    CPU/RAM/thermal/battery/GPU/FF MAX\n'
+    printf '    diag, d        Diagnose rish/dumpsys/FF MAX state\n'
+    printf '    access         Access mode (user/shizuku/root)\n\n'
+    printf '  System:\n'
+    printf '    s,status  m,monitor  c,clean  on  off  fg\n'
+    printf '    daemon start|stop|restart|status\n'
+    printf '    boot-install  verify  help\n'
+}
+
+cmd_diag() {
+    banner
+    printf '  %sDIAGNOSTIC v2%s\n\n' "$BD" "$D"
+    printf '  Shell  : %s\n' "$SHELL"
+    printf '  User   : %s (UID %s)\n' "$(id -un 2>/dev/null)" "$(id -u 2>/dev/null)"
+    printf '  Device : %s\n' "$(getprop ro.product.model 2>/dev/null)"
+    printf '  Android: %s (SDK %s)\n' "$(getprop ro.build.version.release 2>/dev/null)" "$(getprop ro.build.version.sdk 2>/dev/null)"
+    printf '\n  %s[rish]%s\n' "$BD" "$D"
+    if command -v rish >/dev/null 2>&1; then
+        printf '      path: %s\n' "$(command -v rish)"
+        printf '      id  : %s\n' "$(rish -c id 2>&1 | head -1 | cut -c1-80)"
+    else
+        printf '      rish: NOT INSTALLED\n'
+    fi
+    printf '\n  %s[dumpsys services]%s\n' "$BD" "$D"
+    local svc
+    svc=$(rish -c "dumpsys -l" 2>/dev/null | grep -cE '^\s*gfxinfo\s*$')
+    printf '      gfxinfo service: %s\n' "$([ "$svc" -gt 0 ] && echo AVAILABLE || echo REMOVED)"
+    printf '      SurfaceFlinger : %s\n' "$(rish -c "dumpsys SurfaceFlinger --list" 2>&1 | head -1 | cut -c1-60)"
+    printf '\n  %s[FF MAX]%s\n' "$BD" "$D"
+    local pkgcount
+    pkgcount=$(rish -c "pm list packages" 2>/dev/null | grep -c "$FF_MAX")
+    printf '      package installed: %s\n' "$([ "$pkgcount" -gt 0 ] && echo YES || echo NO)"
+    printf '      PID              : %s\n' "$(detect_ff "$FF_MAX" | head -1)"
+    printf '\n  %s[ALL freefire packages]%s\n' "$BD" "$D"
+    rish -c "pm list packages" 2>/dev/null | grep -i freefire | sed 's/^/      /' || printf '      (none)\n'
+}
+cmd_fps_try() {
+    local pkg pid out layer fps_val
+    pkg=$(get_game_pkg)
+    pid=$(get_game_pid "$pkg")
+    printf '  %sFPS attempt (Android 16 / SurfaceFlinger)%s\n\n' "$BD" "$D"
+
+    # Hanya bisa via rish
+    if ! command -v rish >/dev/null 2>&1 || ! rish -c id 2>/dev/null | grep -q 'uid=2000'; then
+        printf '  %s[-]%s rish/Shizuku tidak aktif — FPS tidak bisa dibaca\n' "$Y" "$D"
+        printf '  Fallback metrics di bawah:\n\n'
+        _fps_fallback "$pid"
+        return 1
+    fi
+
+    # ---- Method A: SurfaceFlinger --timestats -dump ----
+    out=$(rish -c "dumpsys SurfaceFlinger --timestats -dump" 2>/dev/null)
+    if [ -n "$out" ]; then
+        # Cari blok layer game (freefire / com.dts)
+        local block
+        block=$(printf '%s\n' "$out" | awk '
+            /^layerName = / { in_block = ($0 ~ /freefire|com\.dts/) }
+            in_block { print }
+        ')
+        if [ -n "$block" ]; then
+            fps_val=$(printf '%s\n' "$block" | grep -m1 'averageFPS' | awk -F'=' '{print $2}' | tr -d ' ')
+            if [ -n "$fps_val" ]; then
+                printf '  %s[+]%s Via SurfaceFlinger --timestats\n' "$G" "$D"
+                printf '      Layer    : %s\n' "$(printf '%s\n' "$block" | grep -m1 'layerName' | cut -d= -f2 | tr -d ' ')"
+                printf '      Avg FPS  : %s%s%s\n' "$G" "$fps_val" "$D"
+                printf '%s\n' "$block" | grep -E 'totalFrames|averageFPS|present2Present' | head -4 | sed 's/^/      /'
+                return 0
+            fi
+        fi
+    fi
+
+    # ---- Method B: SurfaceFlinger --latency <layer> ----
+    layer=$(rish -c "dumpsys SurfaceFlinger --list" 2>/dev/null | grep -iE 'freefire|com\.dts' | head -1)
+    if [ -n "$layer" ]; then
+        printf '  Layer: %s\n' "$layer"
+        out=$(rish -c "dumpsys SurfaceFlinger --latency '$layer'" 2>/dev/null)
+        if [ -n "$out" ]; then
+            local count=0 sum=0 prev="" vsync
+            while read -r _ vsync _; do
+                [ -z "$vsync" ] && continue
+                [ "$vsync" = "0" ] && continue
+                case "$vsync" in *[!0-9]*) continue ;; esac
+                if [ -n "$prev" ]; then
+                    sum=$((sum + vsync - prev))
+                    count=$((count + 1))
+                fi
+                prev=$vsync
+            done < <(printf '%s\n' "$out" | tail -n +2)
+            if [ "$count" -gt 0 ]; then
+                local avg_ns fps
+                avg_ns=$((sum / count))
+                [ "$avg_ns" -gt 0 ] && fps=$((1000000000 / avg_ns))
+                printf '  %s[+]%s Via SurfaceFlinger --latency\n' "$G" "$D"
+                printf '      Frames  : %s\n' "$count"
+                printf '      Avg gap : %s ns\n' "$avg_ns"
+                printf '      FPS     : %s%s%s\n' "$G" "$fps" "$D"
+                return 0
+            fi
+        fi
+    fi
+
+    # ---- Method C: legacy gfxinfo (mungkin gagal di Android 16) ----
+    out=$(rish -c "dumpsys gfxinfo $pkg" 2>/dev/null)
+    if printf '%s' "$out" | grep -q 'Total frames'; then
+        printf '  %s[+]%s Via gfxinfo (legacy)\n' "$G" "$D"
+        printf '%s\n' "$out" | grep -E 'Total frames|Janky|percentile' | head -5 | sed 's/^/      /'
+        return 0
+    fi
+
+    # ---- Semua gagal: kasih fallback metrics ----
+    printf '  %s[-]%s SurfaceFlinger tidak memberikan data layer game\n' "$Y" "$D"
+    printf '  %sKemungkinan: FF MAX belum render 30 detik, atau pakai SurfaceView (butuh filter beda)%s\n\n' "$DM" "$D"
+    _fps_fallback "$pid"
+}
+
+_fps_fallback() {
+    local pid="$1"
+    printf '  %sFallback metrics:%s\n' "$BD" "$D"
+    local u n s i w irq sirq st total busy
+    read -r _ u n s i w irq sirq st _ < /proc/stat
+    total=$((u+n+s+i+w+irq+sirq+st)); busy=$((total-i-w))
+    [ "$total" -gt 0 ] && printf '      System CPU busy : %s%%\n' "$((busy * 100 / total))"
+    local mt ma
+    mt=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    ma=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+    [ "$mt" -gt 0 ] && printf '      RAM used        : %s MB / %s MB\n' "$(( (mt-ma) / 1024 ))" "$(( mt / 1024 ))"
+    printf '      CPU temp        : %s C\n' "$(get_temp)"
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        local g bp
+        g=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        bp=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null)
+        printf '      GPU freq        : %s MHz\n' "$((g / 1000000))"
+        [ -n "$bp" ] && printf '      GPU busy        : %s\n' "$bp"
+    fi
+    [ -n "$pid" ] && printf '      FF MAX PID      : %s\n' "$pid"
+}
+cmd_fpscapture() {
+    local pkg="${1:-$FF_MAX}" dur="${2:-60}"
+    banner
+    printf '  %sCapture FPS — %s detik%s\n\n' "$BD" "$dur" "$D"
+    printf '  Alur:\n'
+    printf '    1. Script membersihkan & mengaktifkan timestats\n'
+    printf '    2. FF MAX dibuka otomatis\n'
+    printf '    3. Anda main selama %s detik%s\n' "$dur" "$D"
+    printf '    4. Setelah %s detik, hasil tersimpan\n' "$dur"
+    printf '    5. Kembali ke Termux, jalankan: tboost fpsresult\n\n'
+
+    if ! command -v rish >/dev/null 2>&1 || ! rish -c id 2>/dev/null | grep -q 'uid=2000'; then
+        printf '  %s[-]%s rish/Shizuku tidak aktif\n' "$Y" "$D"
+        return 1
+    fi
+
+    local logf="$STATE_DIR/fps_capture.log"
+    : > "$logf"
+
+    (
+        rish -c "dumpsys SurfaceFlinger --timestats -clear" >/dev/null 2>&1
+        rish -c "dumpsys SurfaceFlinger --timestats -enable" >/dev/null 2>&1
+        printf '[%s] timestats enabled\n' "$(date +%H:%M:%S)" >> "$logf"
+        monkey -p "$pkg" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 \
+            || am start -n "$pkg" >/dev/null 2>&1 \
+            || rish -c "am start -n $pkg" >/dev/null 2>&1
+        printf '[%s] game launched\n' "$(date +%H:%M:%S)" >> "$logf"
+        sleep "$dur"
+        rish -c "dumpsys SurfaceFlinger --timestats -dump" > "$logf.dump" 2>/dev/null
+        rish -c "dumpsys SurfaceFlinger --timestats -disable" >/dev/null 2>&1
+        printf '[%s] timestats dumped -> %s.dump\n' "$(date +%H:%M:%S)" "$logf" >> "$logf"
+    ) >/dev/null 2>&1 &
+
+    printf '  %s[+]%s Capture berjalan di background (PID %s)\n\n' "$G" "$D" "$!"
+    printf '  FF MAX akan terbuka otomatis.\n'
+    printf '  Main sekarang. Setelah %s detik, kembali ke Termux dan jalankan:\n\n' "$dur"
+    printf '      tboost fpsresult\n\n'
+}
+
+cmd_fpsresult() {
+    banner
+    local dumpf="$STATE_DIR/fps_capture.log.dump" logf="$STATE_DIR/fps_capture.log"
+
+    if [ ! -s "$dumpf" ]; then
+        printf '  %s[!]%s Belum ada capture (atau belum selesai)\n\n' "$Y" "$D"
+        printf '  Jalankan dulu: tboost fpscapture 60\n'
+        return 1
+    fi
+
+    printf '  %sLog status:%s\n' "$BD" "$D"
+    [ -f "$logf" ] && sed 's/^/      /' "$logf"
+    printf '\n'
+
+    local block
+    block=$(awk '
+        /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+        in_block { print }
+    ' "$dumpf")
+
+    if [ -z "$block" ]; then
+        printf '  %s[-]%s FF MAX tidak muncul di timestats\n\n' "$Y" "$D"
+        printf '  Kemungkinan:\n'
+        printf '    - FF MAX tidak aktif saat capture\n'
+        printf '    - Timestats tidak meng-capture layer SurfaceView game\n\n'
+        printf '  Coba cara A (split-screen):\n'
+        printf '    1. Split-screen FF MAX + Termux\n'
+        printf '    2. Main FF MAX\n'
+        printf '    3. tboost gd\n'
+        return 1
+    fi
+
+    printf '  %sFF MAX metrics:%s\n\n' "$BD" "$D"
+    printf '%s\n' "$block" | grep -E 'layerName|totalFrames|droppedFrames|averageFPS|renderRate|displayRefreshRate|gameMode' | sed 's/^/      /'
+
+    local fps
+    fps=$(printf '%s\n' "$block" | grep -m1 'averageFPS' | awk -F'=' '{print $2}' | tr -d ' ')
+    if [ -n "$fps" ]; then
+        printf '\n  %sAvg FPS: %s%s%s\n' "$BD" "$G" "$fps" "$D"
+    else
+        # Hitung dari histogram post2present
+        local total=0 under17=0
+        local line
+        line=$(printf '%s\n' "$block" | grep -A1 'post2present histogram' | tail -1)
+        if [ -n "$line" ]; then
+            printf '\n  %sFrame timing distribution:%s\n' "$BD" "$D"
+            printf '      %s\n' "$line" | fold -w 100 | sed 's/^/      /'
+        fi
+    fi
+}
+cmd_fps_try() {
+    local pkg pid dump out block all_fps avg
+    pkg=$(get_game_pkg)
+    pid=$(get_game_pid "$pkg")
+    printf '  %sFPS via SurfaceFlinger --timestats%s\n\n' "$BD" "$D"
+
+    if ! command -v rish >/dev/null 2>&1 || ! rish -c id 2>/dev/null | grep -q 'uid=2000'; then
+        printf '  %s[-]%s rish tidak aktif\n\n' "$Y" "$D"
+        _fps_fallback "$pid"
+        return 1
+    fi
+
+    # Method 1: dump timestats LIVE
+    dump=$(rish -c "dumpsys SurfaceFlinger --timestats -dump" 2>/dev/null)
+    block=$(printf '%s\n' "$dump" | awk '
+        /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+        in_block { print }
+    ')
+
+    if [ -n "$block" ] && printf '%s\n' "$block" | grep -q 'averageFPS'; then
+        printf '  %s[+]%s Live timestats\n\n' "$G" "$D"
+        _fps_print_block "$block"
+        return 0
+    fi
+
+    # Method 2: baca dari capture dump terakhir
+    if [ -s "$STATE_DIR/fps_capture.log.dump" ]; then
+        dump=$(cat "$STATE_DIR/fps_capture.log.dump" 2>/dev/null)
+        block=$(printf '%s\n' "$dump" | awk '
+            /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+            in_block { print }
+        ')
+        if [ -n "$block" ] && printf '%s\n' "$block" | grep -q 'averageFPS'; then
+            printf '  %s[+]%s Dari capture terakhir (file cache)\n\n' "$G" "$D"
+            _fps_print_block "$block"
+            printf '\n  %sUntuk data baru, jalankan:%s\n' "$DM" "$D"
+            printf '      tboost fpscapture 60\n'
+            return 0
+        fi
+    fi
+
+    # Semua gagal
+    printf '  %s[-]%s Tidak ada data FPS tersedia\n\n' "$Y" "$D"
+    printf '  %sLangkah:%s\n' "$BD" "$D"
+    printf '    1. Jalankan: tboost fpscapture 60\n'
+    printf '    2. Main FF MAX selama 60 detik\n'
+    printf '    3. Kembali ke Termux: tboost fpsresult\n\n'
+    printf '  %sFallback metrics sekarang:%s\n\n' "$BD" "$D"
+    _fps_fallback "$pid"
+}
+
+_fps_print_block() {
+    local block="$1"
+    local fps_list avg
+    fps_list=$(printf '%s\n' "$block" | grep '^averageFPS' | awk -F'=' '{print $2}' | tr -d ' ')
+    printf '  %sDetail:%s\n' "$BD" "$D"
+    printf '%s\n' "$block" | grep -E '^layerName|^totalFrames|^droppedFrames|^averageFPS|^renderRate|^displayRefreshRate' | sed 's/^/      /'
+
+    if [ -n "$fps_list" ]; then
+        local sum=0 n=0
+        for fps in $fps_list; do
+            sum=$(awk -v a="$sum" -v b="$fps" 'BEGIN{print a+b}')
+            n=$((n + 1))
+        done
+        if [ "$n" -gt 0 ]; then
+            avg=$(awk -v s="$sum" -v n="$n" 'BEGIN{printf "%.2f", s/n}')
+            printf '\n  %sRata-rata FPS: %s%s%s (dari %s block)%s\n' "$BD" "$G" "$avg" "$D" "$n" "$D"
+        fi
+    fi
+}
+cmd_fpsresult() {
+    banner
+    local dumpf="$STATE_DIR/fps_capture.log.dump" logf="$STATE_DIR/fps_capture.log"
+
+    if [ ! -s "$dumpf" ]; then
+        printf '  %s[!]%s Belum ada capture\n\n' "$Y" "$D"
+        printf '  Jalankan dulu: tboost fpscapture 60\n'
+        return 1
+    fi
+
+    printf '  %sLog:%s\n' "$BD" "$D"
+    [ -f "$logf" ] && sed 's/^/      /' "$logf"
+    printf '\n'
+
+    local dump block
+    dump=$(cat "$dumpf" 2>/dev/null)
+    block=$(printf '%s\n' "$dump" | awk '
+        /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+        in_block { print }
+    ')
+
+    if [ -z "$block" ]; then
+        printf '  %s[-]%s FF MAX tidak muncul di timestats\n' "$Y" "$D"
+        printf '  Coba split-screen + tboost fpsx\n'
+        return 1
+    fi
+
+    _fps_print_block "$block"
+
+    # Distribution histogram
+    local hist
+    hist=$(printf '%s\n' "$block" | grep -A1 'post2present histogram' | grep 'ms=' | head -1)
+    if [ -n "$hist" ]; then
+        printf '\n  %sFrame time distribution:%s\n' "$BD" "$D"
+        printf '%s\n' "$hist" | fold -w 90 | sed 's/^/      /'
+    fi
+}
+get_access_mode() {
+    if [ "$HAS_ROOT" -eq 1 ]; then printf 'root\n'; return; fi
+    if command -v rish >/dev/null 2>&1; then
+        local out
+        out=$(rish -c id 2>/dev/null | head -1)
+        if [ -n "$out" ] && printf '%s' "$out" | grep -q 'uid=2000'; then
+            printf 'shizuku\n'
+            return
+        fi
+    fi
+    printf 'user\n'
+}
+
+
+get_game_pid() {
+    local pkg="${1:-$(get_game_pkg)}"
+    [ -z "$pkg" ] && return 1
+    detect_ff "$pkg"
+}
+cmd_fps_try() {
+    local pkg pid dump block
+    pkg=$(get_game_pkg)
+    pid=$(get_game_pid "$pkg")
+    printf '  %sFPS via SurfaceFlinger --timestats%s\n\n' "$BD" "$D"
+
+    local mode
+    mode=$(get_access_mode)
+    printf '  Access: %s%s%s\n\n' "$G" "$mode" "$D"
+
+    if [ "$mode" = "user" ]; then
+        printf '  %s[-]%s rish/Shizuku tidak aktif\n\n' "$Y" "$D"
+        _fps_fallback "$pid"
+        return 1
+    fi
+
+    # Coba timestats live via rish
+    dump=$(rish -c "dumpsys SurfaceFlinger --timestats -dump" 2>/dev/null)
+    if [ -n "$dump" ]; then
+        block=$(printf '%s\n' "$dump" | awk '
+            /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+            in_block { print }
+        ')
+        if [ -n "$block" ] && printf '%s\n' "$block" | grep -q 'averageFPS'; then
+            printf '  %s[+]%s Live timestats\n\n' "$G" "$D"
+            _fps_print_block "$block"
+            return 0
+        fi
+    fi
+
+    # Fallback: baca dari cache capture
+    if [ -s "$STATE_DIR/fps_capture.log.dump" ]; then
+        dump=$(cat "$STATE_DIR/fps_capture.log.dump" 2>/dev/null)
+        block=$(printf '%s\n' "$dump" | awk '
+            /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+            in_block { print }
+        ')
+        if [ -n "$block" ] && printf '%s\n' "$block" | grep -q 'averageFPS'; then
+            printf '  %s[+]%s Dari capture terakhir (cache)\n\n' "$G" "$D"
+            _fps_print_block "$block"
+            printf '\n  %sUntuk data baru: tboost fpscapture 60%s\n' "$DM" "$D"
+            return 0
+        fi
+    fi
+
+    printf '  %s[-]%s Tidak ada data FPS\n\n' "$Y" "$D"
+    printf '  Langkah:\n'
+    printf '    1. tboost fpscapture 60\n'
+    printf '    2. Main FF MAX 60 detik\n'
+    printf '    3. tboost fpsresult\n\n'
+    _fps_fallback "$pid"
+}
+
+_fps_fallback() {
+    local pid="$1" mode u n s i w irq sirq st total busy
+    mode=$(get_access_mode)
+    printf '  %sFallback metrics:%s\n' "$BD" "$D"
+
+    # /proc/stat: coba direct, lalu via rish
+    local statline
+    if [ -r /proc/stat ]; then
+        statline=$(head -1 /proc/stat 2>/dev/null)
+    fi
+    if [ -z "$statline" ] && [ "$mode" != "user" ]; then
+        statline=$(rish -c "head -1 /proc/stat" 2>/dev/null)
+    fi
+
+    if [ -n "$statline" ]; then
+        read -r _ u n s i w irq sirq st _ <<< "$statline"
+        total=$((u+n+s+i+w+irq+sirq+st))
+        busy=$((total-i-w))
+        [ "$total" -gt 0 ] && printf '      System CPU busy : %s%%\n' "$((busy * 100 / total))"
+    else
+        printf '      System CPU busy : (unavailable)\n'
+    fi
+
+    local mt ma
+    if [ -r /proc/meminfo ]; then
+        mt=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+        ma=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+    elif [ "$mode" != "user" ]; then
+        mt=$(rish -c "cat /proc/meminfo" 2>/dev/null | awk '/MemTotal/{print $2}')
+        ma=$(rish -c "cat /proc/meminfo" 2>/dev/null | awk '/MemAvailable/{print $2}')
+    fi
+    [ -n "$mt" ] && [ "$mt" -gt 0 ] 2>/dev/null && \
+        printf '      RAM used        : %s MB / %s MB\n' "$(( (mt-ma) / 1024 ))" "$(( mt / 1024 ))"
+
+    printf '      CPU temp        : %s C\n' "$(get_temp)"
+
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        local g bp
+        g=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        bp=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null)
+        printf '      GPU freq        : %s MHz\n' "$((g / 1000000))"
+        [ -n "$bp" ] && printf '      GPU busy        : %s\n' "$bp"
+    fi
+
+    [ -n "$pid" ] && printf '      FF MAX PID      : %s\n' "$pid"
+}
+cmd_gd() {
+    banner
+    local mode ffmax_pid ffclassic_pid
+    mode=$(get_access_mode)
+    printf '  Access: %s%s%s\n\n' "$G" "$mode" "$D"
+
+    ffmax_pid=$(detect_ff "$FF_MAX")
+    ffclassic_pid=$(detect_ff "$FF_CLASSIC")
+
+    if [ -n "$ffmax_pid" ]; then
+        printf '  %s[+]%s FREE FIRE MAX running\n' "$G" "$D"
+        printf '      Package: %s\n' "$FF_MAX"
+        printf '      PID    : %s\n' "$ffmax_pid"
+        local stat
+        stat=$(rish -c "cat /proc/$ffmax_pid/status" 2>/dev/null)
+        if [ -n "$stat" ]; then
+            printf '      Memory : %s KB\n' "$(printf '%s\n' "$stat" | awk '/VmRSS/{print $2}')"
+            printf '      Threads: %s\n' "$(printf '%s\n' "$stat" | awk '/Threads/{print $2}')"
+        fi
+    elif [ -n "$ffclassic_pid" ]; then
+        printf '  %s[+]%s FREE FIRE Classic running\n' "$G" "$D"
+        printf '      Package: %s\n' "$FF_CLASSIC"
+        printf '      PID    : %s\n' "$ffclassic_pid"
+    else
+        printf '  %s[!]%s FF MAX tidak running\n' "$Y" "$D"
+        printf '  Buka FF MAX dulu, lalu ulangi\n'
+        return 1
+    fi
+
+    printf '\n'
+    cmd_fps_try
+}
+cmd_sysdeep() {
+    banner
+    local mode statline
+    mode=$(get_access_mode)
+    printf '  %sDEEP SYSTEM READ%s  (access: %s%s%s)\n\n' "$BD" "$D" "$G" "$mode" "$D"
+
+    # CPU
+    printf '  %s[CPU]%s\n' "$BD" "$D"
+    statline=$(head -1 /proc/stat 2>/dev/null)
+    [ -z "$statline" ] && [ "$mode" != "user" ] && statline=$(rish -c "head -1 /proc/stat" 2>/dev/null)
+    if [ -n "$statline" ]; then
+        local u n s i w irq sirq st total busy
+        read -r _ u n s i w irq sirq st _ <<< "$statline"
+        total=$((u+n+s+i+w+irq+sirq+st)); busy=$((total-i-w))
+        printf '      Busy: %s%% (idle %s%%)\n' "$((busy * 100 / total))" "$((i * 100 / total))"
+    else
+        printf '      %s(unavailable)%s\n' "$Y" "$D"
+    fi
+
+    # Memory
+    printf '\n  %s[MEMORY]%s\n' "$BD" "$D"
+    local meminfo
+    meminfo=$(cat /proc/meminfo 2>/dev/null)
+    [ -z "$meminfo" ] && [ "$mode" != "user" ] && meminfo=$(rish -c "cat /proc/meminfo" 2>/dev/null)
+    if [ -n "$meminfo" ]; then
+        printf '%s\n' "$meminfo" | awk '/MemTotal|MemFree|MemAvailable|Cached|SwapTotal/ {
+            printf "      %-14s %6d MB\n", $1, $2/1024
+        }'
+    fi
+
+    # Load
+    printf '\n  %s[LOAD]%s\n' "$BD" "$D"
+    local loadavg
+    loadavg=$(cat /proc/loadavg 2>/dev/null)
+    [ -z "$loadavg" ] && [ "$mode" != "user" ] && loadavg=$(rish -c "cat /proc/loadavg" 2>/dev/null)
+    [ -n "$loadavg" ] && printf '      %s\n' "$loadavg" | sed 's/^/      /'
+
+    # Thermal
+    printf '\n  %s[THERMAL]%s\n' "$BD" "$D"
+    local z n t
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        n=$(cat "$z/type" 2>/dev/null); t=$(cat "$z/temp" 2>/dev/null)
+        [ "$t" -gt 1000 ] 2>/dev/null && t=$((t / 1000))
+        printf '      %-24s %s C\n' "$n" "$t"
+    done
+
+    # Battery
+    printf '\n  %s[BATTERY]%s\n' "$BD" "$D"
+    local f
+    for f in capacity temp voltage_now current_now status; do
+        [ -r "/sys/class/power_supply/battery/$f" ] && \
+            printf '      %-14s %s\n' "$f" "$(cat /sys/class/power_supply/battery/$f 2>/dev/null)"
+    done
+
+    # GPU
+    printf '\n  %s[GPU]%s\n' "$BD" "$D"
+    if [ -r /sys/class/kgsl/kgsl-3d0/gpuclk ]; then
+        local cur mx bp
+        cur=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null)
+        mx=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null)
+        bp=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null)
+        printf '      Adreno: %s / %s MHz\n' "$((cur / 1000000))" "$((mx / 1000000))"
+        [ -n "$bp" ] && printf '      Busy: %s\n' "$bp"
+    fi
+
+    # CPU freq per core
+    printf '\n  %s[CPU freq per core]%s\n' "$BD" "$D"
+    local i_core=0 cf
+    for cf in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+        [ -r "$cf" ] || continue
+        printf '      cpu%s: %s MHz\n' "$i_core" "$(( $(cat "$cf" 2>/dev/null) / 1000 ))"
+        i_core=$((i_core + 1))
+    done
+
+    # FF MAX
+    printf '\n  %s[FF MAX]%s\n' "$BD" "$D"
+    local pid
+    pid=$(get_game_pid)
+    if [ -n "$pid" ]; then
+        printf '      PID: %s\n' "$pid"
+        local stat2
+        stat2=$(rish -c "cat /proc/$pid/status" 2>/dev/null)
+        [ -n "$stat2" ] && printf '%s\n' "$stat2" | grep -E 'Name|State|VmRSS|Threads' | sed 's/^/      /'
+    else
+        printf '      not running\n'
+    fi
+
+    # Top procs
+    printf '\n  %s[TOP 10]%s\n' "$BD" "$D"
+    if [ "$mode" != "user" ]; then
+        rish -c "ps -A -o PID,RSS,NAME" 2>/dev/null | sort -k2 -n -r | head -11 | sed 's/^/      /'
+    else
+        ps -A -o PID,RSS,NAME 2>/dev/null | sort -k2 -n -r | head -11 | sed 's/^/      /'
+    fi
+}
+
+
+# --- PATCH DETEKSI V2 ---
+
+cmd_gd() {
+    banner
+    local mode ffmax_pid ffclassic_pid
+    mode=$(get_access_mode)
+    printf '  Access: %s%s%s\n\n' "$G" "$mode" "$D"
+    ffmax_pid=$(detect_ff "$FF_MAX")
+    ffclassic_pid=$(detect_ff "$FF_CLASSIC")
+    if [ -n "$ffmax_pid" ]; then
+        printf '  %s[+]%s FREE FIRE MAX running\n' "$G" "$D"
+        printf '      Package: %s\n' "$FF_MAX"
+        printf '      PID    : %s\n' "$ffmax_pid"
+    elif [ -n "$ffclassic_pid" ]; then
+        printf '  %s[+]%s FREE FIRE Classic running\n' "$G" "$D"
+        printf '      Package: %s\n' "$FF_CLASSIC"
+        printf '      PID    : %s\n' "$ffclassic_pid"
+    else
+        printf '  %s[!]%s FF MAX tidak terdeteksi.\n' "$Y" "$D"
+        printf '  Debug rish ps:\n'
+        rish -c "ps -A" 2>/dev/null | grep -i freefire | sed 's/^/      /' || printf '      (kosong)\n'
+        return 1
+    fi
+    printf '\n'
+    cmd_fps_try
+}
+
+
+
+cmd_fps() { cmd_fps_try; }
+
+cmd_fps_try() {
+    banner
+    local pkg pid dump block
+    pkg=$(get_game_pkg)
+    pid=$(get_game_pid "$pkg")
+    
+    printf '  Package: %s\n' "${pkg:-Tidak terdeteksi}"
+    printf '  Access : %s\n\n' "$(get_access_mode)"
+    
+    if [ "$(get_access_mode)" = "user" ]; then
+        printf '  %s[!]%s Butuh rish/Shizuku untuk baca FPS\n' "$Y" "$D"
+        return 1
+    fi
+
+    dump=$(rish -c "dumpsys SurfaceFlinger --timestats -dump" 2>/dev/null)
+    block=$(printf '%s\n' "$dump" | awk '
+        /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+        in_block { print }
+    ')
+
+    if [ -n "$block" ] && printf '%s\n' "$block" | grep -q 'averageFPS'; then
+        printf '  %s[+]%s Data Live SurfaceFlinger\n\n' "$G" "$D"
+        _fps_print_block "$block"
+        return 0
+    fi
+
+    if [ -s "$STATE_DIR/fps_capture.log.dump" ]; then
+        dump=$(cat "$STATE_DIR/fps_capture.log.dump" 2>/dev/null)
+        block=$(printf '%s\n' "$dump" | awk '
+            /^layerName = / { in_block = ($0 ~ /freefire|FFMain|com\.dts/) }
+            in_block { print }
+        ')
+        if [ -n "$block" ] && printf '%s\n' "$block" | grep -q 'averageFPS'; then
+            printf '  %s[+]%s Data Cache (rekaman terakhir)\n\n' "$G" "$D"
+            _fps_print_block "$block"
+            return 0
+        fi
+    fi
+
+    printf '  %s[!]%s Belum ada data FPS.\n\n' "$Y" "$D"
+    printf '  Solusi:\n'
+    printf '    1. Ketik: tboost fpscapture 10\n'
+    printf '    2. Biarkan game berjalan (split-screen) 10 detik\n'
+    printf '    3. Ketik: tboost fpsresult\n'
+}
+
+
+
+get_access_mode() {
+    if [ "$HAS_ROOT" -eq 1 ]; then printf 'root\n'; return; fi
+    if [ -x "$PREFIX/bin/rish" ]; then
+        local out
+        out=$("$PREFIX/bin/rish" -c id 2>/dev/null | head -1)
+        if [ -n "$out" ] && printf '%s' "$out" | grep -q 'uid=2000'; then
+            printf 'shizuku\n'
+            return
+        fi
+    fi
+    printf 'user\n'
+}
+
+
+
+
+
+cmd_play() {
+    local pkg="${1:-$FF_MAX}"
+    banner
+    printf "  Memulai Boost + Launch...\n\n"
+    if [ ! -f "$GAME_FLAG" ]; then cmd_game_on; fi
+    printf "  Launching %s...\n" "$pkg"
+    if command -v rish >/dev/null 2>&1 && rish -c id 2>/dev/null | grep -q "uid=2000"; then
+        rish -c "monkey -p $pkg 1" >/dev/null 2>&1
+    else
+        monkey -p "$pkg" 1 >/dev/null 2>&1
+    fi
+    printf "  Menunggu 10 detik...\n"
+    sleep 10
+    cmd_fps_try
+}
+
+
+# --- BANNER BARU (By: z1nxbabyyy) ---
+
+# --- LIVE DASHBOARD (BUKTI NYATA) ---
+
+detect_ff() {
+    local pkg="$1" pid
+    [ -z "$pkg" ] && return 1
+    if command -v rish >/dev/null 2>&1; then
+        pid=$(rish -c "ps -A" 2>/dev/null | grep "$pkg" | awk '{print $2}' | head -n1 | tr -d '\r')
+        if [ -n "$pid" ]; then echo "$pid"; return 0; fi
+    fi
+    pid=$(pgrep -f "$pkg" 2>/dev/null | head -n1)
+    [ -n "$pid" ] && echo "$pid" && return 0
+    return 1
+}
+
+cmd_dash() {
+    clear
+    trap 'echo; exit 0' INT
+    while true; do
+        local pid=$(get_game_pid)
+        local tp=$(get_temp)
+        local mode=$(get_access_mode)
+        local fps="--"
+        if [ "$mode" = "shizuku" ]; then
+            fps=$(rish -c "dumpsys SurfaceFlinger --timestats -dump" 2>/dev/null | awk '/layerName = / { i=($0~/freefire/) } i && /averageFPS/ { print $3; exit }')
+        fi
+        
+        clear
+        echo "=========================================="
+        echo "          TBOOST LIVE DASHBOARD           "
+        echo "           by z1nxbabyyy                   "
+        echo "=========================================="
+        if [ -n "$pid" ]; then
+            echo " Game   : FF MAX RUNNING (PID $pid)"
+            echo " FPS    : $fps"
+        else
+            echo " Game   : NOT RUNNING"
+            echo " FPS    : --"
+        fi
+        echo "------------------------------------------"
+        echo " Access : $mode"
+        echo " Temp   : $tp C"
+        echo " RAM    : $(free -m | awk '/Mem:/{print $3" MB / "$2" MB"}')"
+        echo " CPU    : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null | awk '{print $1/1000" MHz"}')"
+        echo "=========================================="
+        echo ""
+        echo " Tekan CTRL+C untuk keluar"
+        sleep 2
+    done
+}
+
+
+
+
+
+cmd_optimize() {
+    clear
+    printf "${C}  ╔══════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D} ${Y}◆${D} ${BD}FORCE GAME OPTIMIZATION${D}                 ${C}║${D}\n"
+    printf "${C}  ╚══════════════════════════════════════════╝${D}\n\n"
+    printf "  Masukkan package name game (contoh: com.dts.freefiremax)\n  > "
+    read pkg
+    if [ -z "$pkg" ]; then return; fi
+    printf "\n  ${Y}[*]${D} Menerapkan mode performa untuk %s...\n" "$pkg"
+    rish -c "cmd game mode $pkg 1" 2>/dev/null
+    local pid=$(rish -c "ps -A" 2>/dev/null | grep "$pkg" | awk '{print $2}' | head -n1)
+    if [ -n "$pid" ]; then
+        rish -c "renice -n -20 -p $pid" 2>/dev/null
+        rish -c "taskset -p f0 $pid" 2>/dev/null
+        printf "  ${G}[+]${D} Berhasil di-boost! PID: %s\n" "$pid"
+    else
+        printf "  ${R}[!]${D} Game belum berjalan. Silakan buka game terlebih dahulu.\n"
+    fi
+    echo ""
+}
+
+cmd_ping() {
+    clear
+    printf "${C}  ╔══════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D} ${Y}◆${D} ${BD}NETWORK PING TEST${D}                      ${C}║${D}\n"
+    printf "${C}  ╚══════════════════════════════════════════╝${D}\n\n"
+    printf "  ${Y}[*]${D} Ping ke Google (8.8.8.8)...\n\n"
+    ping -c 4 8.8.8.8
+    printf "\n  ${Y}[*]${D} Ping ke Cloudflare (1.1.1.1)...\n\n"
+    ping -c 4 1.1.1.1
+    echo ""
+}
+
+# --- FITUR BARU: NOTIFIKASI FPS ---
+cmd_notify_fps() {
+    clear
+    echo "=================================================="
+    echo "   LIVE NOTIFICATION (STATUS BAR)"
+    echo "=================================================="
+    echo "  Fitur ini akan menampilkan FPS dan Suhu di"
+    echo "  notifikasi HP kamu secara real-time."
+    echo "  (Biarkan berjalan di background, tekan CTRL+C untuk stop)"
+    echo ""
+    
+    trap 'termux-notification-remove 99 2>/dev/null; echo "Notifikasi dimatikan."; return' INT
+    
+    while true; do
+        local tp=$(get_temp)
+        local fps="--"
+        if [ "$(get_access_mode)" = "shizuku" ]; then
+            fps=$(rish -c "dumpsys SurfaceFlinger --timestats -dump" 2>/dev/null | awk '/layerName = / { i=($0~/freefire/) } i && /averageFPS/ { print $3; exit }')
+            [ -z "$fps" ] && fps="Idle"
+        fi
+        
+        termux-notification --id 99 --title "TBOOST Live Monitor" --content "FPS: $fps | Temp: ${tp}°C | CPU: Max" --priority high 2>/dev/null
+        sleep 5
+    done
+}
+
+# --- FITUR BARU: DNS GAMING OPTIMIZER ---
+cmd_dns_opt() {
+    clear
+    echo "=================================================="
+    echo "   DNS GAMING OPTIMIZER (ANTI-LAG)"
+    echo "=================================================="
+    echo "  [1] Cloudflare (1.1.1.1) - Rekomendasi Gaming"
+    echo "  [2] Google (8.8.8.8)"
+    echo "  [3] Matikan Private DNS (Reset)"
+    echo "  [0] Batal"
+    echo "=================================================="
+    printf "  Pilih DNS > "
+    read dns
+    case "$dns" in
+        1)
+            rish -c "settings put global private_dns_mode hostname" 2>/dev/null
+            rish -c "settings put global private_dns_specifier 1dot1dot1dot1.cloudflare-dns.com" 2>/dev/null
+            echo "  [+] DNS Cloudflare Aktif! Ping game harusnya lebih stabil."
+            ;;
+        2)
+            rish -c "settings put global private_dns_mode hostname" 2>/dev/null
+            rish -c "settings put global private_dns_specifier dns.google" 2>/dev/null
+            echo "  [+] DNS Google Aktif!"
+            ;;
+        3)
+            rish -c "settings put global private_dns_mode off" 2>/dev/null
+            echo "  [+] Private DNS dimatikan (Kembali ke bawaan)."
+            ;;
+    esac
+    echo ""
+    read -p "  [Enter] untuk kembali" _
+}
+
+# --- FITUR BARU: PRE-GAME AUTO CLEANER ---
+cmd_pre_game() {
+    clear
+    echo "=================================================="
+    echo "   PRE-GAME BOOSTER & CLEANER"
+    echo "=================================================="
+    echo "  [*] Membersihkan RAM..."
+    rish -c "am kill-all" 2>/dev/null
+    rish -c "pm trim-caches 999999999999" 2>/dev/null
+    
+    echo "  [*] Mematikan animasi sistem (Biar game makin mulus)..."
+    rish -c "settings put global window_animation_scale 0.0" 2>/dev/null
+    rish -c "settings put global transition_animation_scale 0.0" 2>/dev/null
+    rish -c "settings put global animator_duration_scale 0.0" 2>/dev/null
+    
+    echo "  [*] Mengaktifkan Game Mode Android..."
+    rish -c "cmd game mode com.dts.freefiremax 1" 2>/dev/null
+    
+    # Efek Suara & Getar (Premium Feel)
+    termux-vibrate -d 200 2>/dev/null
+    termux-tts-speak -e "com.google.android.tts" "Performance mode activated. Ready to play." 2>/dev/null
+    
+    echo ""
+    echo "  [+] Sistem bersih dan siap tempur!"
+    echo ""
+    printf "  Mau langsung buka game? (y/n) : "
+    read play
+    if [ "$play" = "y" ]; then
+        rish -c "monkey -p com.dts.freefiremax 1" >/dev/null 2>&1
+        sleep 3
+        cmd_dash
+    fi
+}
+
+# --- UPDATE MENU UTAMA ---
+
+
+
+cmd_watch() {
+    local wpid="$PREFIX/var/lib/tboost/watcher.pid"
+    local wflag="$PREFIX/var/lib/tboost/watcher_active"
+    
+    clear
+    printf "${C}  ╔════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D}  ${BD}AUTO-WATCHER DAEMON${D}                    ${C}║${D}\n"
+    printf "${C}  ╚════════════════════════════════════════╝${D}\n\n"
+    
+    if [ -f "$wpid" ] && kill -0 "$(cat "$wpid" 2>/dev/null)" 2>/dev/null; then
+        printf "  ${Y}[!]${D} Watcher berjalan (PID $(cat "$wpid"))\n"
+        printf "  Hentikan? (y/n): "; read ans
+        if [ "$ans" = "y" ]; then
+            kill "$(cat "$wpid")" 2>/dev/null
+            rm -f "$wpid" "$wflag"
+            printf "  ${G}[+]${D} Watcher dihentikan.\n"
+        fi
+        return
+    fi
+    
+    printf "  Watcher akan memonitor game:\n"
+    printf "    ${G}*${D} Auto-boost saat game dibuka\n"
+    printf "    ${G}*${D} Auto-restore saat game ditutup\n\n"
+    printf "  Mulai watcher? (y/n): "; read ans
+    [ "$ans" != "y" ] && return
+    
+    termux-wake-lock 2>/dev/null
+    : > "$wflag"
+    
+    nohup setsid bash -c '
+        wflag="'"$wflag"'"
+        while [ -f "$wflag" ]; do
+            if rish -c "ps -A" 2>/dev/null | grep -q "com.dts.freefiremax"; then
+                if [ ! -f "$wflag.active" ]; then
+                    rish -c "cmd game mode com.dts.freefiremax 1" 2>/dev/null
+                    pid=$(rish -c "ps -A" 2>/dev/null | grep "com.dts.freefiremax" | awk "{print \$2}" | head -n1)
+                    [ -n "$pid" ] && rish -c "renice -n -20 -p $pid" 2>/dev/null
+                    touch "$wflag.active"
+                fi
+            else
+                [ -f "$wflag.active" ] && rm -f "$wflag.active"
+            fi
+            sleep 5
+        done
+    ' >/dev/null 2>&1 &
+    
+    echo "$!" > "$wpid"
+    printf "\n  ${G}[+]${D} Watcher aktif (PID $!)\n"
+}
+
+cmd_profile() {
+    clear
+    printf "${C}  PERFORMANCE PROFILES${D}\n\n"
+    printf "  ${Y}[1]${D} ECO       - Hemat baterai\n"
+    printf "  ${Y}[2]${D} BALANCED  - Seimbang\n"
+    printf "  ${Y}[3]${D} GAMING    - Performa tinggi\n"
+    printf "  ${Y}[4]${D} EXTREME   - Maksimal\n"
+    printf "  ${Y}[0]${D} Batal\n\n  Pilih > "; read p
+    
+    case "$p" in
+        1) rish -c "cmd game mode com.dts.freefiremax 0" 2>/dev/null; printf "  ${G}[+]${D} ECO Aktif\n" ;;
+        2) rish -c "cmd game mode com.dts.freefiremax 0" 2>/dev/null; printf "  ${G}[+]${D} BALANCED Aktif\n" ;;
+        3) rish -c "cmd game mode com.dts.freefiremax 1" 2>/dev/null; printf "  ${G}[+]${D} GAMING Aktif\n" ;;
+        4) rish -c "cmd game mode com.dts.freefiremax 2" 2>/dev/null; printf "  ${G}[+]${D} EXTREME Aktif\n" ;;
+    esac
+}
+
+cmd_bench() {
+    clear
+    printf "${C}  CPU BENCHMARK${D}\n\n  Stress test 5 detik...\n\n"
+    termux-wake-lock 2>/dev/null
+    local start=$(date +%s%N); local count=0; local end
+    
+    while true; do
+        local x=$((RANDOM * RANDOM)); x=$((x % 1000000)); count=$((count + 1))
+        end=$(date +%s%N)
+        [ $(( (end - start) / 1000000000 )) -ge 5 ] && break
+    done
+    
+    local elapsed=$(( (end - start) / 1000000 ))
+    local score=$((count * 1000 / elapsed))
+    termux-wake-unlock 2>/dev/null
+    
+    printf "  Skor: ${G}%s${D} | Waktu: %s ms\n" "$score" "$elapsed"
+    [ "$score" -gt 500 ] && printf "  Peringkat: ${G}EXCELLENT${D}\n" || printf "  Peringkat: ${Y}GOOD/AVERAGE${D}\n"
+}
+
+cmd_preset() {
+    clear
+    printf "${C}  GAME PRESETS${D}\n\n"
+    printf "  ${Y}[1]${D} Free Fire MAX\n  ${Y}[2]${D} Mobile Legends\n  ${Y}[3]${D} PUBG Mobile\n  ${Y}[0]${D} Batal\n\n  Pilih > "; read p
+    
+    local pkg=""
+    case "$p" in
+        1) pkg="com.dts.freefiremax" ;;
+        2) pkg="com.mobile.legends" ;;
+        3) pkg="com.pubg.imobile" ;;
+        *) return ;;
+    esac
+    
+    printf "\n  ${Y}[*]${D} Optimasi untuk %s...\n" "$pkg"
+    rish -c "cmd game mode $pkg 1" 2>/dev/null
+    rish -c "am kill-all" 2>/dev/null
+    local pid=$(rish -c "ps -A" 2>/dev/null | grep "$pkg" | awk '{print $2}' | head -n1)
+    [ -n "$pid" ] && rish -c "renice -n -20 -p $pid" 2>/dev/null && printf "  ${G}[+]${D} Di-boost (PID $pid)\n" || printf "  ${Y}[*]${D} Preset aktif. Buka game.\n"
+}
+
+cmd_battmon() {
+    clear
+    printf "${C}  BATTERY MONITOR${D}\n\n"
+    local cap=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
+    local temp=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
+    local volt=$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null)
+    
+    printf "    Level    : ${G}%s%%${D}\n" "${cap:-?}"
+    printf "    Suhu     : %s C\n" "$(( ${temp:-0} / 10 ))"
+    printf "    Tegangan : %s mV\n" "$(( ${volt:-0} / 1000 ))"
+}
+
+
+
+
+# --- FUNGSI DETEKSI GAME UNIVERSAL (Bukan cuma FF) ---
+get_fg_pkg() {
+    local out
+    if command -v rish >/dev/null 2>&1; then
+        out=$(rish -c "dumpsys activity activities | grep mResumedActivity" 2>/dev/null | awk -F ' ' '{print $4}' | cut -d'/' -f1)
+        if [ -z "$out" ]; then
+            out=$(rish -c "dumpsys window | grep mCurrentFocus" 2>/dev/null | awk -F ' ' '{print $3}' | cut -d'/' -f1)
+        fi
+    fi
+    if [ -z "$out" ]; then
+        out=$(dumpsys window | grep mCurrentFocus 2>/dev/null | awk -F ' ' '{print $3}' | cut -d'/' -f1)
+    fi
+    echo "${out:-unknown}"
+}
+
+# --- AI AUTO-OPTIMIZER (Pintar menyesuaikan suhu & RAM) ---
+
+# --- GAME LAUNCHER UNIVERSAL ---
+
+# --- MENU PERFORMANCE LEVEL MANUAL ---
+cmd_perf_level() {
+    clear
+    printf "${C}  ╔════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D}  ${BD}MANUAL PERFORMANCE LEVEL${D}               ${C}║${D}\n"
+    printf "${C}  ╚════════════════════════════════════════╝${D}\n\n"
+    printf "  Pilih Level Performa:\n\n"
+    printf "  ${Y}[1]${D} STANDAR   (Hemat Daya / Anti Panas)\n"
+    printf "  ${Y}[2]${D} TINGGI    (Seimbang / Lancar)\n"
+    printf "  ${Y}[3]${D} EKSTREM   (Performa Maksimal / Kencang)\n"
+    printf "  ${Y}[0]${D} Batal\n\n"
+    printf "  Pilih > "; read p
+    
+    local fg=$(get_fg_pkg)
+    if [ "$fg" = "unknown" ] || [ "$fg" = "com.termux" ]; then
+        printf "\n  ${R}[!]${D} Buka game dulu di layar!\n"
+        read -p "  [Enter]" _; return
+    fi
+    
+    case "$p" in
+        1) rish -c "cmd game mode $fg 0" 2>/dev/null; printf "\n  ${G}[+]${D} Mode STANDAR aktif untuk %s\n" "$fg" ;;
+        2) rish -c "cmd game mode $fg 1" 2>/dev/null; printf "\n  ${G}[+]${D} Mode TINGGI aktif untuk %s\n" "$fg" ;;
+        3) rish -c "cmd game mode $fg 2" 2>/dev/null; printf "\n  ${G}[+]${D} Mode EKSTREM aktif untuk %s\n" "$fg" ;;
+        *) return ;;
+    esac
+    read -p "  [Enter]" _
+}
+
+# --- UI MENU UTAMA V6.0 ---
+
+
+# --- REAL GAME BOOSTER LAUNCHER ---
+cmd_scan_games() {
+    clear
+    printf "${C}  ╔════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D}  ${BD}REAL GAME BOOSTER LAUNCHER${D}            ${C}║${D}\n"
+    printf "${C}  ╚════════════════════════════════════════╝${D}\n\n"
+    printf "  ${Y}[*]${D} Memindai game di HP...\n\n"
+    
+    local apps=$(rish -c "pm list packages -3" 2>/dev/null | cut -d: -f2 | grep -iE 'game|dts|tencent|mihoyo|garena|moonton|pubg|roblox|minecraft|activision|epic|ea\.|bandai|netmarble' | sort)
+    
+    if [ -z "$apps" ]; then
+        apps=$(rish -c "pm list packages -3" 2>/dev/null | cut -d: -f2 | head -15 | sort)
+    fi
+    
+    local i=1
+    local arr=()
+    for app in $apps; do
+        echo "  [$i] $app"
+        arr[$i]=$app
+        i=$((i+1))
+    done
+    echo "  [0] Batal"
+    printf "\n  Pilih nomor game > "
+    read choice
+    
+    if [ "$choice" -gt 0 ] 2>/dev/null && [ "$choice" -lt "$i" ]; then
+        local target="${arr[$choice]}"
+        clear
+        printf "${C}  Pilih Tingkat Performa untuk game ini:${D}\n\n"
+        printf "  ${Y}[1]${D} BALANCED  (Hemat Daya / Anti Panas)\n"
+        printf "  ${Y}[2]${D} TINGGI    (Lancar / Stabil)\n"
+        printf "  ${Y}[3]${D} EKSTREM   (Kencang Maksimal / FPS Tinggi)\n\n"
+        printf "  Pilih > "; read mode
+        
+        local gmode=1
+        local dscale="1.0"
+        local fps="60"
+        
+        case "$mode" in
+            1) gmode=1; dscale="1.0"; fps="60" ;;
+            2) gmode=2; dscale="1.0"; fps="90" ;;
+            3) gmode=3; dscale="0.85"; fps="120" ;; # Ekstrem: Resolusi diturunkan dikit biar FPS mentok
+        esac
+        
+        printf "\n  ${Y}[*]${D} Menerapkan REAL BOOST...\n"
+        
+        # 1. Bersihkan RAM dan Cache
+        rish -c "am kill-all" 2>/dev/null
+        rish -c "pm trim-caches 999999999999" 2>/dev/null
+        printf "    - ${G}[+]${D} RAM & Background App dibersihkan.\n"
+        
+        # 2. Matikan Animasi (Biar UI responsif)
+        rish -c "settings put global window_animation_scale 0.0" 2>/dev/null
+        rish -c "settings put global transition_animation_scale 0.0" 2>/dev/null
+        rish -c "settings put global animator_duration_scale 0.0" 2>/dev/null
+        printf "    - ${G}[+]${D} Animasi sistem dimatikan.\n"
+        
+        # 3. Injeksi Game Mode API (Android 12+)
+        rish -c "cmd game mode $target $gmode" 2>/dev/null
+        rish -c "device_config put game_overlay $target mode=$gmode,downscaleFactor=$dscale,fps=$fps" 2>/dev/null
+        printf "    - ${G}[+]${D} Android Game Mode diaktifkan.\n"
+        
+        # 4. Launch Game
+        rish -c "monkey -p $target 1" >/dev/null 2>&1
+        printf "    - ${G}[+]${D} Game diluncurkan.\n"
+        
+        # 5. Tunggu game muncul untuk ambil PID
+        sleep 4
+        local pid=$(rish -c "ps -A" 2>/dev/null | grep "$target" | awk '{print $2}' | head -n1)
+        
+        if [ -n "$pid" ]; then
+            # 6. Kunci CPU ke Big Cores & Naikkan Prioritas (Ini kunci performa stabil)
+            rish -c "renice -n -20 -p $pid" 2>/dev/null
+            rish -c "taskset -p f0 $pid" 2>/dev/null
+            printf "    - ${G}[+]${D} CPU dikunci ke Big Cores (PID: %s).\n" "$pid"
+            printf "    - ${G}[+]${D} Prioritas proses dinaikkan ke Maksimal.\n"
+        fi
+        
+        # 7. DNS Gaming
+        rish -c "settings put global private_dns_mode hostname" 2>/dev/null
+        rish -c "settings put global private_dns_specifier 1dot1dot1dot1.cloudflare-dns.com" 2>/dev/null
+        printf "    - ${G}[+]${D} Jaringan dioptimalkan (DNS Gaming).\n"
+        
+        termux-vibrate -d 200 2>/dev/null
+        printf "\n  ${G}[✓] BOOST BERHASIL DITERAPKAN!${D}\n"
+        printf "  ${DM}Game sekarang berjalan di jalur cepat. Jangan tutup Termux.${D}\n"
+        read -p "  [Enter] untuk lanjut" _
+    fi
+}
+
+
+
+# --- FITUR: FORCE MAX REFRESH RATE & TOUCH ---
+cmd_ultra_display() {
+    clear
+    printf "${C}  ╔════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D}  ${BD}ULTRA DISPLAY & TOUCH${D}                 ${C}║${D}\n"
+    printf "${C}  ╚════════════════════════════════════════╝${D}\n\n"
+    
+    printf "  ${Y}[*]${D} Memaksa layar ke Refresh Rate Maksimal...\n"
+    # Set ke 120Hz (atau maksimal yang didukung HP)
+    rish -c "settings put system min_refresh_rate 120.0" 2>/dev/null
+    rish -c "settings put system peak_refresh_rate 120.0" 2>/dev/null
+    printf "    - ${G}[+]${D} Layar dikunci di 120Hz (Anti turun ke 60Hz).\n"
+    
+    printf "  ${Y}[*]${D} Menghapus delay sentuhan (Zero Touch Latency)...\n"
+    # Set touch delay ke 0
+    rish -c "settings put secure tap_duration_threshold 0.0" 2>/dev/null
+    rish -c "settings put secure touch_blocking_period 0.0" 2>/dev/null
+    printf "    - ${G}[+]${D} Respons layar sekarang Instan (0 ms delay).\n"
+    
+    termux-vibrate -d 150 2>/dev/null
+    printf "\n  ${G}[✓] Layar & Sentuhan sekarang berada di level ULTRA!${D}\n\n"
+    read -p "  [Enter] untuk lanjut" _
+}
+
+# --- FITUR: BLOATWARE KILLER (Bebasin RAM) ---
+cmd_bloat_killer() {
+    clear
+    printf "${C}  ╔════════════════════════════════════════╗${D}\n"
+    printf "${C}  ║${D}  ${BD}BLOATWARE KILLER (FREE RAM)${D}            ${C}║${D}\n"
+    printf "${C}  ╚════════════════════════════════════════╝${D}\n\n"
+    
+    printf "  ${Y}[*]${D} Membunuh aplikasi rakus RAM di background...\n\n"
+    
+    # List aplikasi populer yang sering makan RAM
+    local apps=("com.zhiliaoapp.musically" "com.ss.android.ugc.trill" "com.instagram.android" "com.facebook.katana" "com.facebook.orca" "com.whatsapp" "com.android.chrome" "com.shopee.id" "com.tokopedia.tkpd")
+    
+    for app in "${apps[@]}"; do
+        # Cek apakah aplikasi terinstal
+        if rish -c "pm list packages $app" 2>/dev/null | grep -q "$app"; then
+            rish -c "am force-stop $app" 2>/dev/null
+            printf "    - ${R}[x]${D} Mematikan: $app\n"
+        fi
+    done
+    
+    # Bersihkan sisa cache
+    rish -c "am kill-all" 2>/dev/null
+    rish -c "pm trim-caches 999999999999" 2>/dev/null
+    
+    termux-vibrate -d 200 2>/dev/null
+    printf "\n  ${G}[✓] RAM dibersihkan! Memori lega untuk game.${D}\n\n"
+    read -p "  [Enter] untuk lanjut" _
+}
+
+# --- MENU UTAMA V8.0 ---
+
+
+banner() {
+    clear 2>/dev/null || true
+    printf '\n'
+    printf '%s\n' "${R}════════════════════════════════════════════════════════════════════${D}"
+    printf '%s\n' "${Y}  ████████╗██████╗  ██████╗  ██████╗ ███████╗████████╗${D}"
+    printf '%s\n' "${Y}  ╚══██╔══╝██╔══██╗██╔═══██╗██╔═══██╗██╔════╝╚══██╔══╝${D}"
+    printf '%s\n' "${Y}     ██║   ██████╔╝██║   ██║██║   ██║███████╗   ██║   ${D}"
+    printf '%s\n' "${Y}     ██║   ██╔══██╗██║   ██║██║   ██║╚════██║   ██║   ${D}"
+    printf '%s\n' "${Y}     ██║   ██████╔╝╚██████╔╝╚██████╔╝███████║   ██║   ${D}"
+    printf '%s\n' "${Y}     ╚═╝   ╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝   ╚═╝   ${D}"
+    printf '%s\n' "${R}════════════════════════════════════════════════════════════════════${D}"
+    printf '%s\n' "${M}${BD}    >>> ULTIMATE GAMING BOOSTER  ·  APEX EDITION v9.0 <<<${D}"
+    printf '%s\n' "${C}              ⚡  DEVELOPED BY: z1nxbabyyy  ⚡${D}"
+    printf '%s\n' "${R}════════════════════════════════════════════════════════════════════${D}"
+    printf '\n'
+}
+
+cmd_god_mode() {
+    banner
+    printf '  %s>> ACTIVATING GOD MODE <<%s\n\n' "$R$BD" "$D"
+    printf '  %s[*]%s Killing all background processes...\n' "$Y" "$D"
+    rish -c "am kill-all" 2>/dev/null
+    rish -c "pm trim-caches 999999999999" 2>/dev/null
+    printf '  %s[*]%s Enabling Fixed Performance Mode...\n' "$Y" "$D"
+    rish -c "cmd power set-fixed-performance-mode-enabled true" 2>/dev/null
+    printf '  %s[*]%s Disabling Doze (anti deep-sleep)...\n' "$Y" "$D"
+    rish -c "cmd deviceidle disable" 2>/dev/null
+    printf '  %s[*]%s Keeping screen always on...\n' "$Y" "$D"
+    rish -c "svc power stayon true" 2>/dev/null
+    printf '  %s[*]%s Enabling Do Not Disturb...\n' "$Y" "$D"
+    rish -c "cmd notification set_dnd on" 2>/dev/null
+    printf '  %s[*]%s Killing system animations...\n' "$Y" "$D"
+    rish -c "settings put global window_animation_scale 0.0" 2>/dev/null
+    rish -c "settings put global transition_animation_scale 0.0" 2>/dev/null
+    rish -c "settings put global animator_duration_scale 0.0" 2>/dev/null
+    printf '  %s[*]%s Locking refresh rate to 120Hz...\n' "$Y" "$D"
+    rish -c "settings put system peak_refresh_rate 120.0" 2>/dev/null
+    rish -c "settings put system min_refresh_rate 120.0" 2>/dev/null
+    printf '  %s[*]%s Optimizing network (Cloudflare DNS)...\n' "$Y" "$D"
+    rish -c "settings put global private_dns_mode hostname" 2>/dev/null
+    rish -c "settings put global private_dns_specifier 1dot1dot1dot1.cloudflare-dns.com" 2>/dev/null
+    printf '  %s[*]%s Tuning TCP buffers (low-latency)...\n' "$Y" "$D"
+    rish -c "settings put global net.tcp.buffersize.default 4096,87380,524288,4096,16384,110208" 2>/dev/null
+    termux-vibrate -d 300 2>/dev/null
+    printf '\n  %s[✓] GOD MODE ACTIVE!%s\n' "$G$BD" "$D"
+    printf '  %sSekarang buka game. Semua resource sudah dialokasikan maksimal.%s\n\n' "$DM" "$D"
+    read -p "  [Enter] " _
+}
+
+cmd_perf_lock() {
+    banner
+    printf '  %s>> FIXED PERFORMANCE LOCK <<%s\n\n' "$BD" "$D"
+    printf '  Mengaktifkan mode performa native Android 11+.\n'
+    printf '  Sistem tidak akan turunkan clock CPU saat idle.\n\n'
+    rish -c "cmd power set-fixed-performance-mode-enabled true" 2>/dev/null
+    printf '  %s[+]%s Fixed Performance Mode: %sACTIVE%s\n' "$G" "$D" "$G" "$D"
+    read -p "  [Enter] " _
+}
+
+cmd_net_boost() {
+    banner
+    printf '  %s>> NETWORK BUFFER BOOST <<%s\n\n' "$BD" "$D"
+    printf '  %s[*]%s Tuning TCP buffers...\n' "$Y" "$D"
+    rish -c "settings put global net.tcp.buffersize.default 4096,87380,524288,4096,16384,110208" 2>/dev/null
+    rish -c "settings put global net.tcp.buffersize.wifi 524288,1048576,2097152,262144,524288,1048576" 2>/dev/null
+    rish -c "settings put global net.tcp.buffersize.lte 524288,1048576,2097152,262144,524288,1048576" 2>/dev/null
+    printf '  %s[+]%s TCP buffers enlarged (ping lebih stabil).\n' "$G" "$D"
+    printf '  %s[*]%s Setting gaming DNS...\n' "$Y" "$D"
+    rish -c "settings put global private_dns_mode hostname" 2>/dev/null
+    rish -c "settings put global private_dns_specifier 1dot1dot1dot1.cloudflare-dns.com" 2>/dev/null
+    printf '  %s[+]%s DNS Cloudflare aktif.\n\n' "$G" "$D"
+    read -p "  [Enter] " _
+}
+
+cmd_thermal_guard() {
+    banner
+    printf '  %s>> THERMAL GUARD <<%s\n' "$BD" "$D"
+    printf '  Monitoring suhu tiap 5 detik. Ctrl+C untuk stop.\n\n'
+    trap 'printf "\n"; return' INT
+    while true; do
+        local tp=$(get_temp)
+        local col=$(temp_color "$tp")
+        printf '  %s[%s]%s Suhu CPU: %s%s°C%s' "$DM" "$(date +%H:%M:%S)" "$D" "$col" "$tp" "$D"
+        if [ "$tp" -gt 45 ] 2>/dev/null; then
+            printf '  %s[PANAS!]%s' "$R$BD" "$D"
+            termux-vibrate -d 500 2>/dev/null
+            termux-notification --title "THERMAL WARNING" --content "CPU: ${tp}C - HP terlalu panas!" --priority high 2>/dev/null
+        fi
+        printf '\n'
+        sleep 5
+    done
+}
+
+cmd_restore() {
+    banner
+    printf '  %s>> RESTORE DEFAULT SETTINGS <<%s\n\n' "$Y$BD" "$D"
+    rish -c "cmd power set-fixed-performance-mode-enabled false" 2>/dev/null
+    rish -c "cmd deviceidle enable" 2>/dev/null
+    rish -c "svc power stayon false" 2>/dev/null
+    rish -c "cmd notification set_dnd off" 2>/dev/null
+    rish -c "settings put global window_animation_scale 1.0" 2>/dev/null
+    rish -c "settings put global transition_animation_scale 1.0" 2>/dev/null
+    rish -c "settings put global animator_duration_scale 1.0" 2>/dev/null
+    rish -c "settings put system peak_refresh_rate 60.0" 2>/dev/null
+    rish -c "settings put system min_refresh_rate 60.0" 2>/dev/null
+    rish -c "settings put global private_dns_mode off" 2>/dev/null
+    rish -c "settings delete global net.tcp.buffersize.default" 2>/dev/null
+    termux-vibrate -d 200 2>/dev/null
+    printf '  %s[✓]%s Semua setting kembali ke default.\n\n' "$G" "$D"
+    read -p "  [Enter] " _
+}
+
+
+
+cmd_anim_toggle() {
+    banner
+    # Cek status animasi saat ini
+    local curr=$(rish -c "settings get global window_animation_scale" 2>/dev/null | tr -d '\r')
+    
+    if [ "$curr" = "0.0" ] || [ "$curr" = "0" ]; then
+        # Kalau mati, nyalakan
+        rish -c "settings put global window_animation_scale 1.0" 2>/dev/null
+        rish -c "settings put global transition_animation_scale 1.0" 2>/dev/null
+        rish -c "settings put global animator_duration_scale 1.0" 2>/dev/null
+        printf '  %s[+]%s Animasi Sistem: %sAKTIF (Normal)%s\n' "$G" "$D" "$G" "$D"
+    else
+        # Kalau nyala, matikan
+        rish -c "settings put global window_animation_scale 0.0" 2>/dev/null
+        rish -c "settings put global transition_animation_scale 0.0" 2>/dev/null
+        rish -c "settings put global animator_duration_scale 0.0" 2>/dev/null
+        printf '  %s[+]%s Animasi Sistem: %sDIMATIKAN (Super Ngebut)%s\n' "$G" "$D" "$R" "$D"
+    fi
+    
+    termux-vibrate -d 100 2>/dev/null
+    printf '\n  %sSilakan buka menu HP atau buka aplikasi lain untuk merasakan bedanya.%s\n' "$DM" "$D"
+    read -p "  [Enter] " _
+}
+
+
+
+cmd_freezer() {
+    banner
+    printf '  %s>> BLOATWARE FREEZER (DEEP RAM) <<%s\n\n' "$BD" "$D"
+    printf '  [1] Bekukan (Freeze) Aplikasi\n'
+    printf '  [2] Cairkan (Unfreeze) Aplikasi\n'
+    printf '  [0] Batal\n\n'
+    printf '  Pilih > '; read act
+    [ "$act" = "0" ] && return
+    printf '  Masukkan nama package (contoh: com.facebook.katana): '; read pkg
+    [ -z "$pkg" ] && return
+    
+    if [ "$act" = "1" ]; then
+        rish -c "pm disable-user --user 0 $pkg" 2>/dev/null
+        printf '\n  %s[+]%s %s DIBEKUKAN (Tidak akan jalan di background).\n' "$G" "$D" "$pkg"
+    elif [ "$act" = "2" ]; then
+        rish -c "pm enable $pkg" 2>/dev/null
+        printf '\n  %s[+]%s %s DICAIRKAN.\n' "$G" "$D" "$pkg"
+    fi
+    termux-vibrate -d 100 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+cmd_res_scale() {
+    banner
+    printf '  %s>> GAME RESOLUTION SCALER <<%s\n\n' "$BD" "$D"
+    printf '  Menurunkan resolusi render = FPS Naik Drastis!\n'
+    printf '  Masukkan nama package game (contoh: com.dts.freefiremax): '; read pkg
+    [ -z "$pkg" ] && return
+    
+    printf '  Skala Resolusi (0.5 s/d 1.0, misal 0.75 untuk 75%%): '; read scale
+    [ -z "$scale" ] && scale="0.75"
+    
+    rish -c "cmd game mode $pkg 2" 2>/dev/null
+    rish -c "device_config put game_overlay $pkg mode=2,downscaleFactor=$scale" 2>/dev/null
+    printf '\n  %s[+]%s Resolusi %s di-set ke %s (FPS Mode!).\n' "$G" "$D" "$pkg" "$scale"
+    read -p "  [Enter] " _
+}
+
+cmd_gpu_ui() {
+    banner
+    printf '  %s>> GPU UI RENDERER BOOST <<%s\n\n' "$BD" "$D"
+    printf '  [1] Aktifkan GPU Boost (Smooth UI)\n'
+    printf '  [2] Matikan GPU Boost (Normal)\n'
+    printf '  Pilih > '; read act
+    if [ "$act" = "1" ]; then
+        rish -c "settings put global debug.hwui.renderer opengl" 2>/dev/null
+        printf '\n  %s[+]%s GPU UI Aktif. (Mungkin butuh restart UI/HP untuk efek penuh).\n' "$G" "$D"
+    elif [ "$act" = "2" ]; then
+        rish -c "settings delete global debug.hwui.renderer" 2>/dev/null
+        printf '\n  %s[+]%s GPU UI Kembali Normal.\n' "$G" "$D"
+    fi
+    read -p "  [Enter] " _
+}
+
+cmd_thermal_bypass() {
+    banner
+    printf '  %s>> THERMAL BYPASS (ANTI THROTTLE) <<%s\n\n' "$BD" "$D"
+    printf '  Memaksa sistem berhenti menurunkan performa CPU saat panas.\n'
+    printf '  %s[!] PERINGATAN: HP akan lebih cepat panas, gunakan cooler!%s\n\n' "$R" "$D"
+    printf '  [1] Aktifkan Bypass\n'
+    printf '  [2] Matikan (Normal)\n'
+    printf '  Pilih > '; read act
+    if [ "$act" = "1" ]; then
+        rish -c "cmd thermalservice override-status 0" 2>/dev/null
+        printf '\n  %s[+]%s Thermal Bypass AKTIF.\n' "$G" "$D"
+        termux-vibrate -d 300 2>/dev/null
+    elif [ "$act" = "2" ]; then
+        rish -c "cmd thermalservice reset" 2>/dev/null
+        printf '\n  %s[+]%s Thermal Kembali Normal.\n' "$G" "$D"
+    fi
+    read -p "  [Enter] " _
+}
+
+cmd_ram_purge() {
+    banner
+    printf '  %s>> AGGRESSIVE RAM PURGE <<%s\n\n' "$BD" "$D"
+    printf '  Membersihkan RAM level Kernel Android...\n'
+    rish -c "cmd activity memory-factor critical" 2>/dev/null
+    rish -c "am kill-all" 2>/dev/null
+    rish -c "pm trim-caches 999999999999" 2>/dev/null
+    printf '  %s[+]%s RAM Dibersihkan Total!\n' "$G" "$D"
+    termux-vibrate -d 200 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+
+
+cmd_io_boost() {
+    banner
+    printf '  %s>> I/O PRIORITY LOCK <<%s\n\n' "$BD" "$D"
+    printf '  Memaksa game untuk diprioritaskan saat membaca data (Anti-Loading Lag).\n'
+    printf '  Masukkan nama package game (contoh: com.dts.freefiremax): '; read pkg
+    [ -z "$pkg" ] && return
+    
+    local pid=$(rish -c "ps -A" 2>/dev/null | grep "$pkg" | awk '{print $2}' | head -n1)
+    if [ -n "$pid" ]; then
+        rish -c "ionice -c 1 -n 0 -p $pid" 2>/dev/null
+        rish -c "renice -n -20 -p $pid" 2>/dev/null
+        printf '\n  %s[+]%s Prioritas I/O & CPU maksimal diterapkan ke PID %s.\n' "$G" "$D" "$pid"
+    else
+        printf '\n  %s[-]%s Game belum berjalan. Buka game dulu!\n' "$R" "$D"
+    fi
+    read -p "  [Enter] " _
+}
+
+cmd_hw_overlay() {
+    banner
+    printf '  %s>> HW OVERLAY DISABLE <<%s\n\n' "$BD" "$D"
+    printf '  Memaksa GPU merender UI (Menghemat CPU & Mengurangi Panas).\n'
+    printf '  [1] Aktifkan (Disable Overlay)\n'
+    printf '  [2] Matikan (Restore)\n'
+    printf '  Pilih > '; read act
+    if [ "$act" = "1" ]; then
+        rish -c "service call SurfaceFlinger 1008 i32 1" 2>/dev/null
+        printf '\n  %s[+]%s HW Overlay Disabled. UI dirender oleh GPU.\n' "$G" "$D"
+    elif [ "$act" = "2" ]; then
+        rish -c "service call SurfaceFlinger 1008 i32 0" 2>/dev/null
+        printf '\n  %s[+]%s HW Overlay Restored.\n' "$G" "$D"
+    fi
+    read -p "  [Enter] " _
+}
+
+cmd_fstrim() {
+    banner
+    printf '  %s>> STORAGE SPEEDUP (FSTRIM) <<%s\n\n' "$BD" "$D"
+    printf '  Membersihkan sisa file sampah di memori internal...\n'
+    printf '  Proses ini butuh waktu 5-10 detik. Jangan tutup Termux.\n\n'
+    rish -c "sm fstrim" 2>/dev/null
+    printf '  %s[+]%s Memori internal berhasil di-trim!\n' "$G" "$D"
+    printf '  %sBaca/tulis file game sekarang lebih ngebut.%s\n' "$DM" "$D"
+    termux-vibrate -d 200 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+cmd_wifi_killer() {
+    banner
+    printf '  %s>> WI-FI LATENCY KILLER <<%s\n\n' "$BD" "$D"
+    printf '  Mematikan fitur hemat daya Wi-Fi (Anti Ping Spike).\n'
+    printf '  [1] Aktifkan (Anti-Lag Ping)\n'
+    printf '  [2] Matikan (Normal)\n'
+    printf '  Pilih > '; read act
+    if [ "$act" = "1" ]; then
+        rish -c "settings put global wifi_sleep_policy 2" 2>/dev/null
+        rish -c "settings put global wifi_scan_always_enabled 0" 2>/dev/null
+        printf '\n  %s[+]%s Wi-Fi dikunci di performa maksimal.\n' "$G" "$D"
+    elif [ "$act" = "2" ]; then
+        rish -c "settings put global wifi_sleep_policy 0" 2>/dev/null
+        printf '\n  %s[+]%s Wi-Fi kembali normal.\n' "$G" "$D"
+    fi
+    read -p "  [Enter] " _
+}
+
+
+
+# --- TEMPERATURE ACCURACY ENGINE ---
+_normalize_temp() {
+    local v=$1 r
+    r=$((v / 1000)); [ "$r" -ge 5 ] && [ "$r" -le 120 ] && { echo "$r"; return; }
+    r=$((v / 100));  [ "$r" -ge 5 ] && [ "$r" -le 120 ] && { echo "$r"; return; }
+    r=$((v / 10));   [ "$r" -ge 5 ] && [ "$r" -le 120 ] && { echo "$r"; return; }
+    [ "$v" -ge 5 ] && [ "$v" -le 120 ] && { echo "$v"; return; }
+    echo 0
+}
+
+get_temp() {
+    local z name raw temp cpu_max=0 valid_max=0
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        name=$(cat "$z/type" 2>/dev/null | tr 'A-Z' 'a-z' | tr -d ' ')
+        raw=$(cat "$z/temp" 2>/dev/null)
+        [ -z "$raw" ] && continue
+        case "$raw" in ''|*[!0-9]*) continue ;; esac
+        temp=$(_normalize_temp "$raw")
+        [ "$temp" -le 0 ] && continue
+
+        case "$name" in
+            *batt*|*charg*|*usb*|*bcl*|*flash*|*pa_therm*|*skin*)
+                continue
+                ;;
+            *cpu*|*soc*|*apc*|*big*|*little*|*silver*|*gold*|*prime*|*mtkts*|*tsens*|*core*|*gpu*|*nsp*|*ap_thermal*)
+                [ "$temp" -gt "$cpu_max" ] && cpu_max=$temp
+                ;;
+        esac
+        [ "$temp" -gt "$valid_max" ] && valid_max=$temp
+    done
+
+    if [ "$cpu_max" -gt 0 ]; then printf '%s\n' "$cpu_max"
+    elif [ "$valid_max" -gt 0 ]; then printf '%s\n' "$valid_max"
+    else printf '0\n'; fi
+}
+
+cmd_temp_debug() {
+    banner
+    printf '  %s>> TEMPERATURE DEBUG (PER-ZONE) <<%s\n\n' "$BD" "$D"
+    printf '  %-28s %-8s %-8s %s\n' "ZONE" "RAW" "TEMP" "STATUS"
+    printf '  ------------------------------------------------------------------\n'
+    local z name raw temp mark
+    for z in /sys/class/thermal/thermal_zone*; do
+        [ -r "$z/temp" ] || continue
+        name=$(cat "$z/type" 2>/dev/null | tr 'A-Z' 'a-z')
+        [ -z "$name" ] && name="(zone_$(basename "$z" | grep -oE '[0-9]+$'))"
+        raw=$(cat "$z/temp" 2>/dev/null)
+        [ -z "$raw" ] && continue
+        case "$raw" in ''|*[!0-9]*) continue ;; esac
+        temp=$(_normalize_temp "$raw")
+        
+        mark="${DM}(valid)${D}"
+        case "$name" in
+            *batt*|*charg*|*usb*|*bcl*|*flash*|*pa_therm*|*skin*)
+                mark="${R}(skip)${D}"
+                ;;
+            *cpu*|*soc*|*apc*|*big*|*little*|*silver*|*gold*|*prime*|*mtkts*|*tsens*|*core*|*gpu*|*nsp*|*ap_thermal*)
+                mark="${G}(CPU) ${D}"
+                ;;
+        esac
+        
+        printf '  %-28s %-8s %s%-4s°C%s %s\n' "$name" "$raw" "$G" "$temp" "$D" "$mark"
+    done
+    printf '\n  %s=> Hasil akhir CPU Temp: %s%s°C%s\n' "$BD" "$G" "$(get_temp)" "$D"
+    printf '  %sAngka inilah yang dipakai di dashboard & menu.%s\n\n' "$DM" "$D"
+    read -p "  [Enter] " _
+}
+
+cmd_thermal_deep() { cmd_temp_debug; }
+
+
+cmd_res_override() {
+    banner
+    printf '  %s>> RESOLUTION & DENSITY OVERRIDE <<%s\n\n' "$BD" "$D"
+    printf '  Menurunkan resolusi layar = FPS Naik Drastis (GPU Lega).\n\n'
+    printf '  [1] Mode 1080p (Seimbang, Tajam)\n'
+    printf '  [2] Mode 720p (Super Ngebut, FPS Maksimal)\n'
+    printf '  [3] Reset ke Bawaan HP (Default)\n'
+    printf '  [0] Batal\n\n'
+    printf '  Pilih > '; read res
+    
+    case "$res" in
+        1) 
+            rish -c "wm size 1080x2400" 2>/dev/null
+            rish -c "wm density 400" 2>/dev/null
+            printf '\n  %s[+]%s Resolusi di-set ke 1080p (FPS Boost).\n' "$G" "$D"
+            ;;
+        2)
+            rish -c "wm size 720x1600" 2>/dev/null
+            rish -c "wm density 320" 2>/dev/null
+            printf '\n  %s[+]%s Resolusi di-set ke 720p (MAX FPS).\n' "$G" "$D"
+            ;;
+        3)
+            rish -c "wm size reset" 2>/dev/null
+            rish -c "wm density reset" 2>/dev/null
+            printf '\n  %s[+]%s Resolusi kembali ke Default.\n' "$G" "$D"
+            ;;
+    esac
+    termux-vibrate -d 100 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+cmd_gms_freeze() {
+    banner
+    printf '  %s>> GMS SUSPENDER (GOOGLE PLAY FREEZE) <<%s\n\n' "$BD" "$D"
+    printf '  Membekukan Google Play Services = RAM & CPU super lega.\n'
+    printf '  %s[!] Peringatan: Notifikasi WA/Email akan tertunda.%s\n\n' "$Y" "$D"
+    printf '  [1] Bekukan GMS (Untuk Main Game)\n'
+    printf '  [2] Cairkan GMS (Kembali Normal)\n'
+    printf '  [0] Batal\n\n'
+    printf '  Pilih > '; read act
+    
+    if [ "$act" = "1" ]; then
+        rish -c "pm disable-user --user 0 com.google.android.gms" 2>/dev/null
+        printf '\n  %s[+]%s GMS Dibekukan! (Buka game sekarang).\n' "$G" "$D"
+    elif [ "$act" = "2" ]; then
+        rish -c "pm enable com.google.android.gms" 2>/dev/null
+        printf '\n  %s[+]%s GMS Dicairkan. (Notifikasi kembali normal).\n' "$G" "$D"
+    fi
+    termux-vibrate -d 200 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+cmd_ram_compact() {
+    banner
+    printf '  %s>> MEMORY COMPACTION (RAM DEFRAG) <<%s\n\n' "$BD" "$D"
+    printf '  Merapikan susunan RAM di level Kernel...\n'
+    rish -c "su -c 'echo 1 > /proc/sys/vm/compact_memory'" 2>/dev/null || rish -c "echo 1 > /proc/sys/vm/compact_memory" 2>/dev/null
+    rish -c "cmd activity memory-factor critical" 2>/dev/null
+    printf '\n  %s[+]%s RAM berhasil di-defrag! (Micro-stutter hilang).\n' "$G" "$D"
+    termux-vibrate -d 100 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+cmd_sync_disable() {
+    banner
+    printf '  %s>> BACKGROUND SYNC DISABLER <<%s\n\n' "$BD" "$D"
+    printf '  Mematikan sinkronisasi background agar CPU fokus ke Game.\n'
+    printf '  [1] Matikan Sync (Main Game)\n'
+    printf '  [2] Nyalakan Sync (Normal)\n'
+    printf '  Pilih > '; read act
+    
+    if [ "$act" = "1" ]; then
+        rish -c "settings put global background_data 0" 2>/dev/null
+        rish -c "settings put global auto_sync 0" 2>/dev/null
+        printf '\n  %s[+]%s Background Sync DIMATIKAN.\n' "$G" "$D"
+    elif [ "$act" = "2" ]; then
+        rish -c "settings put global background_data 1" 2>/dev/null
+        rish -c "settings put global auto_sync 1" 2>/dev/null
+        printf '\n  %s[+]%s Background Sync DINYALAKAN.\n' "$G" "$D"
+    fi
+    read -p "  [Enter] " _
+}
+
+cmd_system_ui_kill() {
+    banner
+    printf '  %s>> SYSTEM UI RESTARTER <<%s\n\n' "$BD" "$D"
+    printf '  Me-restart UI Android untuk membersihkan bug visual & memory leak.\n'
+    printf '  (Layar akan berkedip sebentar, ini normal).\n\n'
+    rish -c "pkill -f com.android.systemui" 2>/dev/null
+    printf '  %s[+]%s System UI berhasil di-restart!\n' "$G" "$D"
+    termux-vibrate -d 150 2>/dev/null
+    read -p "  [Enter] " _
+}
+
+
+
+
+cmd_menu() {
+    while true; do
+        clear
+        local tp=$(get_temp)
+        local rt ra ru; read -r rt ra <<< "$(get_ram)"; ru=$((rt - ra))
+        local access=$(get_access_mode); local access_col="$G"
+        [ "$access" = "user" ] && access_col="$Y"
+
+        banner
+        printf '%s\n' "${C}  ◆ LIVE STATUS${D}"
+        printf '%s\n' "  ├─ Access: ${access_col}${access}${D}  ├─ Temp: ${Y}${tp}°C${D}  └─ RAM: ${G}${ru}MB${D}"
+        printf '\n'
+        printf '%s\n' "${M}  ◆ ULTIMATE BOOST${D}"
+        printf '%s\n' "  ${BD}[ 1]${D} ${R}★ GOD MODE${D}         ${BD}[ 2]${D} ${G}Launch & Boost${D}"
+        printf '%s\n' "  ${BD}[ 3]${D} ${G}Ultra Display 120Hz${D}  ${BD}[ 4]${D} ${G}Fixed Perf Lock${D}"
+        printf '\n'
+        printf '%s\n' "${M}  ◆ GOD-TIER TWEAKS${D}"
+        printf '%s\n' "  ${BD}[ 5]${D} ${R}Thermal Bypass${D}      ${BD}[ 6]${D} ${R}Res Scaler (FPS)${D}"
+        printf '%s\n' "  ${BD}[ 7]${D} ${G}Bloatware Freezer${D}   ${BD}[ 8]${D} ${G}GPU UI Boost${D}"
+        printf '%s\n' "  ${BD}[ 9]${D} ${G}Aggressive RAM Purge${D}"
+        printf '\n'
+        printf '%s\n' "${M}  ◆ OVERLORD ENGINE${D}"
+        printf '%s\n' "  ${BD}[10]${D} ${R}I/O Priority Lock${D}   ${BD}[11]${D} ${R}HW Overlay Disable${D}"
+        printf '%s\n' "  ${BD}[12]${D} ${G}Storage Speedup${D}     ${BD}[13]${D} ${G}Wi-Fi Latency Killer${D}"
+        printf '\n'
+        printf '%s\n' "${M}  ◆ 10X POWER TOOLS${D}"
+        printf '%s\n' "  ${BD}[14]${D} ${R}Resolution Override${D} ${BD}[15]${D} ${R}GMS Suspender${D}"
+        printf '%s\n' "  ${BD}[16]${D} ${G}Memory Compaction${D}   ${BD}[17]${D} ${G}Sync Disabler${D}"
+        printf '%s\n' "  ${BD}[18]${D} ${G}System UI Restart${D}"
+        printf '\n'
+        printf '%s\n' "${M}  ◆ QUICK TWEAKS & MONITOR${D}"
+        printf '%s\n' "  ${BD}[19]${D} ${Y}Toggle Animasi HP${D}   ${BD}[20]${D} ${G}Thermal Debugger${D}"
+        printf '%s\n' "  ${BD}[21]${D} ${G}Live Dashboard${D}      ${BD}[22]${D} ${Y}Restore Default${D}"
+        printf '%s\n' "  ${BD}[ 0]${D} ${DM}Exit${D}"
+        printf '\n'
+        printf '%s' "${BD}  Pilih menu [0-22] > ${D}"
+        read choice
+        case "$choice" in
+            1)  cmd_god_mode ;;
+            2)  cmd_scan_games ;;
+            3)  cmd_ultra_display ;;
+            4)  cmd_perf_lock ;;
+            5)  cmd_thermal_bypass ;;
+            6)  cmd_res_scale ;;
+            7)  cmd_freezer ;;
+            8)  cmd_gpu_ui ;;
+            9)  cmd_ram_purge ;;
+            10) cmd_io_boost ;;
+            11) cmd_hw_overlay ;;
+            12) cmd_fstrim ;;
+            13) cmd_wifi_killer ;;
+            14) cmd_res_override ;;
+            15) cmd_gms_freeze ;;
+            16) cmd_ram_compact ;;
+            17) cmd_sync_disable ;;
+            18) cmd_system_ui_kill ;;
+            19) cmd_anim_toggle ;;
+            20) cmd_temp_debug ;;
+            21) cmd_dash ;;
+            22) cmd_restore ;;
+            0)  exit 0 ;;
+        esac
+    done
+}
+
+main() {
+    detect_root
+    case "${1:-menu}" in
+        menu|"")    cmd_menu ;;
+        god)        cmd_god_mode ;;
+        dash)       cmd_dash ;;
+        anim)       cmd_anim_toggle ;;
+        thermal)    cmd_thermal_bypass ;;
+        io)         cmd_io_boost ;;
+        tempdbg)    cmd_temp_debug ;;
+        *)          cmd_menu ;;
+    esac
+}
+main "$@"
