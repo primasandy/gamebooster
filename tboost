@@ -3000,7 +3000,6 @@ cmd_menu() {
         printf '%s\n' "${M}  ◆ QUICK TWEAKS & MONITOR${D}"
         printf '%s\n' "  ${BD}[19]${D} ${Y}Toggle Animasi HP${D}   ${BD}[20]${D} ${G}Thermal Debugger${D}"
         printf '%s\n' "  ${BD}[21]${D} ${G}Live Dashboard${D}      ${BD}[22]${D} ${Y}Restore Default${D}"
-        printf "%s\n" "  ${BD}[23]${D} ${Y}Switch to PC Mode${D}"
         printf '%s\n' "  ${BD}[ 0]${D} ${DM}Exit${D}"
         printf '\n'
         printf '%s' "${BD}  Pilih menu [0-22] > ${D}"
@@ -3028,7 +3027,6 @@ cmd_menu() {
             20) cmd_temp_debug ;;
             21) cmd_dash ;;
             22) cmd_restore ;;
-            23) exec bash ./tboost-pc ;;
             0)  exit 0 ;;
         esac
     done

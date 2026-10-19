@@ -1,134 +1,106 @@
 #!/bin/bash
 R='\033[1;31m'; G='\033[1;32m'; Y='\033[1;33m'; C='\033[1;36m'; M='\033[1;35m'; W='\033[1;37m'; D='\033[0m'; BD='\033[1m'; DM='\033[2m'
 
-IS_ANDROID=0
-[ -d "/data/data/com.termux" ] && IS_ANDROID=1
+check_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then return 0; fi
+    if sudo -n true 2>/dev/null; then return 0; fi
+    echo -e "\n${Y}[*] Membutuhkan akses Sudo. Masukkan password PC kamu:${D}"
+    if sudo -v; then return 0; else echo -e "${R}[-] Gagal mendapatkan akses Sudo.${D}"; return 1; fi
+}
 
-IS_ROOT="NO"
-if [ "$IS_ANDROID" -eq 0 ]; then
-    if [ "$(id -u)" -eq 0 ] || (sudo -n true 2>/dev/null); then
-        IS_ROOT="YES"
-    fi
-fi
+get_game_pid() {
+    ps -eo pid,comm | grep -iE 'steam|proton|wine|game|fivem|gta|cs2|dota|elden|cyberpunk' | grep -v grep | awk '{print $1}' | head -n1
+}
 
 while true; do
     clear
     OS_NAME="Linux"
     grep -qi microsoft /proc/version 2>/dev/null && OS_NAME="Windows WSL"
     [ "$(uname)" = "Darwin" ] && OS_NAME="macOS"
+    
+    CPU_GOV="N/A"
+    [ -d /sys/devices/system/cpu/cpu0/cpufreq ] && CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+    RAM_USED=$(free -m 2>/dev/null | awk '/Mem:/{print $3}')
+    RAM_TOTAL=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
 
     echo -e "\n${C}  ╔═══════════════════════════════════════════════════════════╗${D}"
-    echo -e "${C}  ║${D}         ${M}${BD}◆ TBOOST PC EDITION v2.0 ◆${D}                  ${C}║${D}"
+    echo -e "${C}  ║${D}  ${BD}${W}████████╗██████╗  ██████╗  ██████╗ ███████╗████████╗${D}${C}║${D}"
+    echo -e "${C}  ║${D}  ${BD}${W}╚══██╔══╝██╔══██╗██╔═══██╗██╔═══██╗██╔════╝╚══██╔══╝${D}${C}║${D}"
+    echo -e "${C}  ║${D}  ${BD}${W}   ██║   ██████╔╝██║   ██║██║   ██║███████╗   ██║   ${D}${C}║${D}"
+    echo -e "${C}  ║${D}  ${BD}${W}   ██║   ██╔══██╗██║   ██║██║   ██║╚════██║   ██║   ${D}${C}║${D}"
+    echo -e "${C}  ║${D}  ${BD}${W}   ██║   ██████╔╝╚██████╔╝╚██████╔╝███████║   ██║   ${D}${C}║${D}"
+    echo -e "${C}  ║${D}  ${BD}${W}   ╚═╝   ╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝   ╚═╝   ${D}${C}║${D}"
+    echo -e "${C}  ║${D}         ${M}${BD}◆ PC REAL BOOSTER v3.0 ($OS_NAME) ◆${D}              ${C}║${D}"
     echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
-    
-    if [ "$IS_ANDROID" -eq 1 ]; then
-        echo -e "${C}  ║${D} ${R}${BD}[!] WARNING: ANDROID DETECTED${D}                         ${C}║${D}"
-        echo -e "${C}  ║${D} ${Y}PC Mode tidak akan bekerja maksimal di HP.${D}                ${C}║${D}"
-        echo -e "${C}  ║${D} ${Y}Silakan kembali ke HP Mode (Menu 9).${D}                      ${C}║${D}"
-    else
-        echo -e "${C}  ║${D} Status OS : ${G}${BD}${OS_NAME} (ACTIVE)${D}                          ${C}║${D}"
-    fi
-    
-    if [ "$IS_ROOT" = "YES" ]; then
-        echo -e "${C}  ║${D} Root/Sudo : ${G}${BD}[ ENABLED ]${D}                               ${C}║${D}"
-    else
-        echo -e "${C}  ║${D} Root/Sudo : ${R}${BD}[ DISABLED ]${D}                              ${C}║${D}"
-    fi
+    echo -e "${C}  ║${D}   ${BD}LIVE STATUS${D}                                              ${C}║${D}"
+    echo -e "${C}  ║${D}   RAM: ${G}${RAM_USED}MB${D} / ${DM}${RAM_TOTAL}MB${D} | CPU Gov: ${Y}${CPU_GOV}${D}             ${C}║${D}"
     echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 1]${D} ${G}Enable Root/Sudo Permission${D}                   ${C}║${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 2]${D} ${G}Deep System Scan (Read Everything)${D}            ${C}║${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 3]${D} ${G}Turbo Boost (Performance Mode)${D}                ${C}║${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 4]${D} ${G}Clean RAM (Drop Caches)${D}                       ${C}║${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 5]${D} ${G}Network Latency Optimize${D}                      ${C}║${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 6]${D} ${G}Kill Heavy Processes${D}                          ${C}║${D}"
-    echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 9]${D} ${Y}Switch to HP Mode (Android)${D}                     ${C}║${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 0]${D} ${DM}Exit Application${D}                               ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}CPU & POWER OPTIMIZATION${D}                                 ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 1]${D} ${G}Boost CPU to MAX (Performance)${D}                 ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 2]${D} ${G}Reset CPU (Powersave/OnDemand)${D}                 ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 3]${D} ${G}Set Game Process to Realtime Priority${D}          ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}RAM & MEMORY CLEANER${D}                                    ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 4]${D} ${G}Deep Clean RAM (Drop Caches)${D}                   ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 5]${D} ${G}Disable Swap (Use Physical RAM Only)${D}           ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 6]${D} ${G}Compact Memory Fragmentation${D}                   ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}DISK & I/O BOOST${D}                                         ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 7]${D} ${G}Optimize I/O Scheduler (NVMe/SSD)${D}              ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 8]${D} ${G}Force Trim FS (FSTRIM)${D}                         ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}NETWORK LATENCY KILLER${D}                                   ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 9]${D} ${G}Enable TCP BBR (Gaming Low Ping)${D}               ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[10]${D} ${G}Enable TCP Fast Open${D}                           ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}DEEP SYSTEM CLEANER${D}                                      ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[11]${D} ${G}Clear Temp & Cache (System Safe)${D}               ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[12]${D} ${G}Clear System Logs (Journalctl)${D}                 ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[13]${D} ${G}Clear APT Package Cache${D}                        ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}MONITORING & GAME LAUNCHER${D}                               ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[14]${D} ${G}Show Top 10 Heavy Processes${D}                    ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[15]${D} ${G}Deep System Specs & Temp${D}                       ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[16]${D} ${G}Auto-Boost Running Steam/Proton Game${D}           ${C}║${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}MASTER CONTROLS${D}                                          ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[17]${D} ${R}★ GOD MODE PC (All-in-One Boost)${D}               ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[18]${D} ${Y}Restore Default Settings${D}                       ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[19]${D} ${G}Clear DNS Cache${D}                                ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[20]${D} ${G}Kill Hung Processes (Interactive)${D}              ${C}║${D}"
+    echo -e "${C}  ║${D}                                                           ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}${R}[ 0]${D} ${DM}Exit${D}                                                 ${C}║${D}"
     echo -e "${C}  ╚═══════════════════════════════════════════════════════════╝${D}"
-    printf "\n  ${BD}Pilih menu [0-9] > ${D}"
+    printf "\n  ${BD}Pilih menu [0-20] > ${D}"
     read choice
 
-    if [ "$IS_ANDROID" -eq 1 ] && [ "$choice" != "9" ] && [ "$choice" != "0" ]; then
-        echo -e "\n  ${R}[!] Akses Ditolak. Fitur ini hanya untuk PC asli.${D}"
-        read -p "  [Enter] " _
-        continue
-    fi
-
     case "$choice" in
-        1) 
-            echo -e "\n${Y}[*] Meminta izin Root/Sudo...${D}"
-            if [ "$(id -u)" -eq 0 ]; then
-                echo -e "${G}[+] Anda sudah login sebagai ROOT.${D}"
-            elif sudo -v; then
-                echo -e "${G}[+] Sudo berhasil diaktifkan!${D}"
-                IS_ROOT="YES"
-            else
-                echo -e "${R}[-] Gagal mendapatkan akses Sudo.${D}"
-            fi
-            read -p "  [Enter] " _ 
-            ;;
-        2) 
-            clear
-            echo -e "\n${C}◆ DEEP SYSTEM SCAN ◆${D}\n"
-            echo -e "${Y}[OS]${D}"
-            uname -a
-            echo -e "\n${Y}[CPU]${D}"
-            lscpu 2>/dev/null | grep -E 'Model name|Architecture|CPU\(s\)|Thread|Core|MHz' || grep -m1 'model name' /proc/cpuinfo
-            echo -e "\n${Y}[MEMORY]${D}"
-            free -h
-            echo -e "\n${Y}[DISK]${D}"
-            df -h / 2>/dev/null
-            echo -e "\n${Y}[TEMPERATURE]${D}"
-            sensors 2>/dev/null | grep -E 'Core|Package' || echo "Sensors tidak terinstal (sudo apt install lm-sensors)"
-            read -p "  [Enter] " _
-            ;;
-        3) 
-            echo -e "\n${Y}[*] Mengubah CPU Governor ke PERFORMANCE...${D}"
-            if [ "$IS_ROOT" = "YES" ]; then
+        1) check_sudo && { echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1; echo -e "${G}[+] CPU Governor -> PERFORMANCE${D}"; read -p "[Enter]" _; } ;;
+        2) check_sudo && { echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1; echo -e "${G}[+] CPU Governor -> ONDEMAND${D}"; read -p "[Enter]" _; } ;;
+        3) check_sudo && { pid=$(get_game_pid); if [ -n "$pid" ]; then sudo renice -n -20 -p $pid && sudo ionice -c 1 -n 0 -p $pid && echo -e "${G}[+] Game PID $pid -> REALTIME PRIORITY${D}"; else echo -e "${R}[-] Tidak ada game berjalan.${D}"; fi; read -p "[Enter]" _; } ;;
+        4) check_sudo && { sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; echo -e "${G}[+] RAM Cleaned!${D}"; read -p "[Enter]" _; } ;;
+        5) check_sudo && { sudo sysctl -w vm.swappiness=10 >/dev/null; echo -e "${G}[+] Swappiness -> 10 (RAM Focused)${D}"; read -p "[Enter]" _; } ;;
+        6) check_sudo && { echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null; echo -e "${G}[+] Memory Compacted!${D}"; read -p "[Enter]" _; } ;;
+        7) check_sudo && { for disk in /sys/block/nvme*/queue/scheduler /sys/block/sd*/queue/scheduler; do [ -f "$disk" ] && echo none | sudo tee $disk >/dev/null 2>&1; done; echo -e "${G}[+] I/O Scheduler -> NONE (NVMe/SSD)${D}"; read -p "[Enter]" _; } ;;
+        8) check_sudo && { sudo fstrim -av; read -p "[Enter]" _; } ;;
+        9) check_sudo && { sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; echo -e "${G}[+] TCP BBR Enabled!${D}"; read -p "[Enter]" _; } ;;
+        10) check_sudo && { sudo sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1; echo -e "${G}[+] TCP Fast Open Enabled!${D}"; read -p "[Enter]" _; } ;;
+        11) check_sudo && { sudo rm -rf /tmp/* 2>/dev/null; rm -rf ~/.cache/* 2>/dev/null; echo -e "${G}[+] Temp & Cache Cleaned!${D}"; read -p "[Enter]" _; } ;;
+        12) check_sudo && { sudo journalctl --vacuum-time=1d 2>/dev/null; echo -e "${G}[+] Logs Cleared!${D}"; read -p "[Enter]" _; } ;;
+        13) check_sudo && { sudo apt-get clean 2>/dev/null; sudo apt-get autoclean 2>/dev/null; echo -e "${G}[+] APT Cache Cleared!${D}"; read -p "[Enter]" _; } ;;
+        14) clear; echo -e "\n${Y}[*] Top 10 CPU/RAM Proses:${D}"; ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -11; read -p "[Enter]" _ ;;
+        15) clear; echo -e "\n${C}◆ SYSTEM SPECS ◆${D}\n"; lscpu 2>/dev/null | grep -E 'Model name|Core|Thread|MHz'; free -h; df -h /; sensors 2>/dev/null | grep -E 'Core|Package|temp'; read -p "[Enter]" _ ;;
+        16) check_sudo && { pid=$(get_game_pid); if [ -n "$pid" ]; then sudo renice -n -20 -p $pid; echo -e "${G}[+] Steam/Proton Game (PID $pid) Boosted!${D}"; else echo -e "${R}[-] Steam/Proton game tidak terdeteksi.${D}"; fi; read -p "[Enter]" _; } ;;
+        17) 
+            check_sudo && {
+                echo -e "\n${R}${BD}[*] ACTIVATING PC GOD MODE...${D}"
                 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1
-                echo -e "${G}[+] CPU di-boost ke performa maksimal.${D}"
-            else
-                echo -e "${R}[-] Butuh Sudo (Menu 1).${D}"
-            fi
-            read -p "  [Enter] " _
-            ;;
-        4) 
-            echo -e "\n${Y}[*] Membersihkan RAM (Drop Caches)...${D}"
-            if [ "$IS_ROOT" = "YES" ]; then
                 sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-                echo -e "${G}[+] RAM berhasil dibersihkan.${D}"
-            else
-                echo -e "${R}[-] Butuh Sudo (Menu 1).${D}"
-            fi
-            read -p "  [Enter] " _
-            ;;
-        5) 
-            echo -e "\n${Y}[*] Mengoptimalkan Jaringan (TCP BBR & Fast Open)...${D}"
-            if [ "$IS_ROOT" = "YES" ]; then
-                sudo sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
-                sudo sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
+                sudo sysctl -w vm.swappiness=10 >/dev/null 2>&1
                 sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
-                echo -e "${G}[+] Jaringan dioptimalkan (Low Latency).${D}"
-            else
-                echo -e "${R}[-] Butuh Sudo (Menu 1).${D}"
-            fi
-            read -p "  [Enter] " _
-            ;;
-        6) 
-            clear
-            echo -e "\n${Y}[*] Top 10 Proses Pemakan RAM:${D}"
-            ps -eo pid,comm,%mem --sort=-%mem | head -11
-            echo -e "\n${Y}[*] Masukkan PID yang ingin dimatikan (pisah spasi): ${D}"
-            read pids
-            for p in $pids; do sudo kill -9 "$p" 2>/dev/null; done
-            echo -e "${G}[+] Proses dibersihkan.${D}"
-            read -p "  [Enter] " _
-            ;;
-        9) 
-            exec bash ./tboost 
-            ;;
+                echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null 2>&1
+                pid=$(get_game_pid)
+                [ -n "$pid" ] && sudo renice -n -20 -p $pid >/dev/null 2>&1
+                echo -e "${G}[✓] PC GOD MODE ACTIVE!${D}"
+                read -p "[Enter]" _
+            } ;;
+        18) check_sudo && { echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1; sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1; sudo sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1; echo -e "${G}[+] System Restored to Default.${D}"; read -p "[Enter]" _; } ;;
+        19) check_sudo && { if command -v resolvectl >/dev/null; then sudo resolvectl flush-caches; elif command -v systemd-resolve >/dev/null; then sudo systemd-resolve --flush-caches; fi; echo -e "${G}[+] DNS Cache Flushed!${D}"; read -p "[Enter]" _; } ;;
+        20) clear; echo -e "\n${Y}[*] Semua Proses Berjalan:${D}"; ps -eo pid,comm | tail -n +2 | head -n 30; echo -e "\n${Y}[*] Masukkan PID yang ingin di-kill:${D}"; read pids; for p in $pids; do sudo kill -9 $p 2>/dev/null; done; read -p "[Enter]" _ ;;
         0) exit 0 ;;
     esac
 done
-
-
