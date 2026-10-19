@@ -2,7 +2,15 @@
 R='\033[1;31m'; G='\033[1;32m'; Y='\033[1;33m'; C='\033[1;36m'; M='\033[1;35m'; W='\033[1;37m'; D='\033[0m'; BD='\033[1m'; DM='\033[2m'
 CACHE="$HOME/.tboost_last_game"
 
+# Deteksi apakah berjalan di WSL (Windows Subsystem for Linux)
+IS_WSL=0
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    IS_WSL=1
+fi
+
 check_sudo() {
+    # Di WSL, sudo hanya untuk Linux, tapi kita butuh PowerShell untuk Windows
+    if [ "$IS_WSL" -eq 1 ]; then return 0; fi
     [ "$(id -u)" -eq 0 ] && return 0
     sudo -n true 2>/dev/null && return 0
     echo -e "\n${Y}[*] Membutuhkan akses Sudo...${D}"
@@ -22,282 +30,212 @@ spin() {
         sleep 0.1
     done
     wait $pid
-    local rc=$?
-    if [ $rc -eq 0 ]; then
-        printf "\r  ${G}[✓]${D} %s     \n" "$msg"
-    else
-        printf "\r  ${R}[✗]${D} %s     \n" "$msg"
-    fi
-    return $rc
+    printf "\r  ${G}[✓]${D} %s     \n" "$msg"
 }
 
-process_picker() {
-    local pid_file=$(mktemp)
-    ps -eo pid,%cpu,%mem,comm --sort=-%cpu --no-headers 2>/dev/null | \
-        grep -vE '\s+(bash|sh|ps|top|awk|grep|sed|sleep|tmux|screen|kworker.*|ksoftirqd.*|migration.*|rcu_.*|watchdog.*|kthreadd|init|Xorg|.*shell|kwin.*|Xwayland|pulseaudio|pipewire.*|dbus.*|avahi.*|cron|rsyslogd|NetworkManager|wpa_supplicant|ModemManager|sshd|agetty|systemd.*|gdm.*|lightdm|sddm|xdg.*|at-spi.*|ibus.*|gvfs.*|tracker.*|evolution.*|gnome.*|plasma.*|kinfocenter|kaccess|kded[0-9]*|tboost-pc|tboost)\s*$' > "$pid_file"
+wsl_process_picker() {
+    local tmp_file=$(mktemp)
+    echo -e "\n  ${Y}[*]${D} Membaca proses Windows (Host)..."
     
-    local total=$(wc -l < "$pid_file")
-    [ "$total" -eq 0 ] && { echo -e "  ${R}[-] Tidak ada proses.${D}"; rm -f "$pid_file"; return 1; }
+    # Ambil tasklist Windows, buang proses sistem, format rapi
+    tasklist.exe /fo csv /nh 2>/dev/null | \
+        grep -vE "svchost|System|Registry|smss|csrss|wininit|services|lsass|fontdrvhost|dwm|explorer|sihost|ctfmon|SearchApp|ShellExperienceHost|StartMenu|RuntimeBroker|ApplicationFrameHost|taskhostw|conhost|MoUsoCoreWorker|spoolsv|WmiPrvSE|TrustedInstaller|SecurityHealth|TextInputHost|backgroundTaskHost|MicrosoftEdge|msedge|SearchProtocolHost|SearchFilterHost|LockApp|YourPhone|PhoneExperienceHost|Widgets|WidgetService" | \
+        awk -F '","' '{print $2"|"$1}' | sort -u > "$tmp_file"
+
+    local total=$(wc -l < "$tmp_file")
+    [ "$total" -eq 0 ] && { echo -e "  ${R}[-] Tidak bisa membaca proses Windows. Pastikan Interop aktif.${D}"; rm -f "$tmp_file"; return 1; }
     
     while true; do
         clear
         echo -e "\n${C}  ╔═══════════════════════════════════════════════════════════╗${D}"
-        echo -e "${C}  ║${D}  ${BD}PROCESS PICKER — Cheat Engine Style${D}                     ${C}║${D}"
+        echo -e "${C}  ║${D}  ${BD}WINDOWS PROCESS PICKER (via WSL)${D}                      ${C}║${D}"
         echo -e "${C}  ╚═══════════════════════════════════════════════════════════╝${D}\n"
-        echo -e "  ${DM}Pilih nomor atau ketik PID manual.${D}\n"
-        printf "  ${BD}%-4s %-8s %-6s %-6s %s${D}\n" "No" "PID" "CPU%" "MEM%" "PROCESS"
+        printf "  ${BD}%-4s %-8s %s${D}\n" "No" "PID" "WINDOWS PROCESS (EXE)"
         echo "  ────────────────────────────────────────────────────────────────"
         
         local i=0
-        while read -r pid cpu mem comm; do
+        while IFS='|' read -r pid pname; do
             i=$((i+1))
-            printf "  ${BD}[%2d]${D} %-8s %-6s %-6s %s\n" "$i" "$pid" "$cpu" "$mem" "$comm"
-        done < "$pid_file"
+            printf "  ${BD}[%2d]${D} %-8s %s\n" "$i" "$pid" "$pname"
+            [ "$i" -ge 25 ] && break # Batasi 25 biar gak kepanjangan
+        done < "$tmp_file"
         
         echo "  ────────────────────────────────────────────────────────────────"
         echo -e "  ${BD}[ 0]${D} Batal\n"
-        printf "  ${BD}Pilih [0-$i] atau ketik PID > ${D}"
+        printf "  ${BD}Pilih nomor proses (0-$i) > ${D}"
         read sel
         
-        [ "$sel" = "0" ] && { rm -f "$pid_file"; return 1; }
+        [ "$sel" = "0" ] && { rm -f "$tmp_file"; return 1; }
         
-        local cpid="" cname=""
         if [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le "$i" ] 2>/dev/null; then
-            local line=$(sed -n "${sel}p" "$pid_file")
-            cpid=$(echo "$line" | awk '{print $1}')
-            cname=$(echo "$line" | awk '{print $4}')
-        elif [ -d "/proc/$sel" ] 2>/dev/null; then
-            cpid="$sel"
-            cname=$(ps -o comm= -p "$cpid" 2>/dev/null)
+            local line=$(sed -n "${sel}p" "$tmp_file")
+            local cpid=$(echo "$line" | cut -d'|' -f1)
+            local cname=$(echo "$line" | cut -d'|' -f2)
+            
+            echo -e "\n  ${G}[✓]${D} Target Windows: ${BD}$cname${D} (PID $cpid)"
+            read -p "  ${BD}Gunakan proses ini? (y/n) > ${D}" confirm
+            if [ "$confirm" = "y" ]; then
+                rm -f "$tmp_file"
+                echo "$cpid $cname" > "$CACHE"
+                echo "$cpid"
+                return 0
+            fi
         else
-            echo -e "\n  ${R}[-] Pilihan tidak valid.${D}"; sleep 1; continue
+            echo -e "\n  ${R}[-] Pilihan tidak valid.${D}"; sleep 1
         fi
+    done
+}
+
+linux_process_picker() {
+    local tmp_file=$(mktemp)
+    ps -eo pid,%cpu,%mem,comm --sort=-%cpu --no-headers 2>/dev/null | grep -vE '\s+(bash|sh|ps|top|tboost-pc)\s*$' > "$tmp_file"
+    local total=$(wc -l < "$tmp_file")
+    [ "$total" -eq 0 ] && { echo -e "  ${R}[-] Tidak ada proses.${D}"; rm -f "$tmp_file"; return 1; }
+    
+    while true; do
+        clear
+        echo -e "\n${C}  ╔═══════════════════════════════════════════════════════════╗${D}"
+        echo -e "${C}  ║${D}  ${BD}LINUX PROCESS PICKER${D}                                   ${C}║${D}"
+        echo -e "${C}  ╚═══════════════════════════════════════════════════════════╝${D}\n"
+        printf "  ${BD}%-4s %-8s %-6s %-6s %s${D}\n" "No" "PID" "CPU%" "MEM%" "PROCESS"
+        echo "  ────────────────────────────────────────────────────────────────"
+        local i=0
+        while read -r pid cpu mem comm; do
+            i=$((i+1)); printf "  ${BD}[%2d]${D} %-8s %-6s %-6s %s\n" "$i" "$pid" "$cpu" "$mem" "$comm"
+        done < "$tmp_file"
+        echo "  ────────────────────────────────────────────────────────────────"
+        echo -e "  ${BD}[ 0]${D} Batal\n"
+        printf "  ${BD}Pilih nomor proses (0-$i) > ${D}"; read sel
         
-        echo -e "\n  ${G}[✓]${D} Target: ${BD}$cname${D} (PID $cpid)"
-        echo -e "  ${DM}Detail lengkap:${D}"
-        ps -p "$cpid" -o pid,user,%cpu,%mem,stat,args 2>/dev/null | sed 's/^/    /'
-        echo ""
-        read -p "  ${BD}Gunakan proses ini? (y/n) > ${D}" confirm
-        if [ "$confirm" = "y" ]; then
-            rm -f "$pid_file"
-            echo "$cpid $cname" > "$CACHE"
-            echo "$cpid"
-            return 0
+        [ "$sel" = "0" ] && { rm -f "$tmp_file"; return 1; }
+        
+        if [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le "$i" ] 2>/dev/null; then
+            local line=$(sed -n "${sel}p" "$tmp_file")
+            local cpid=$(echo "$line" | awk '{print $1}')
+            local cname=$(echo "$line" | awk '{print $4}')
+            echo -e "\n  ${G}[✓]${D} Target Linux: ${BD}$cname${D} (PID $cpid)"
+            read -p "  ${BD}Gunakan proses ini? (y/n) > ${D}" confirm
+            if [ "$confirm" = "y" ]; then
+                rm -f "$tmp_file"
+                echo "$cpid $cname" > "$CACHE"
+                echo "$cpid"
+                return 0
+            fi
+        else
+            echo -e "\n  ${R}[-] Pilihan tidak valid.${D}"; sleep 1
         fi
     done
 }
 
 get_game_pid() {
-    local pid pname confirm
-    
-    # 1. Cek cache (game terakhir)
+    local pid confirm
+    # Cek cache
     if [ -f "$CACHE" ]; then
         local cpid=$(awk '{print $1}' "$CACHE")
         local cname=$(awk '{$1=""; sub(/^ /,""); print}' "$CACHE")
-        if [ -n "$cpid" ] && [ -d "/proc/$cpid" ] 2>/dev/null; then
-            echo -e "\n  ${Y}[?]${D} Game terakhir: ${G}$cname${D} ${DM}(PID $cpid)${D}" >&2
-            read -p "  Pakai ini? (y/n) > " confirm
-            if [ "$confirm" = "y" ]; then echo "$cpid"; return 0; fi
-        fi
-    fi
-    
-    # 2. Auto-detect via window focus
-    if command -v xdotool >/dev/null 2>&1; then
-        pid=$(xdotool getactivewindow getwindowpid 2>/dev/null)
-        if [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null; then
-            pname=$(ps -o comm= -p "$pid" 2>/dev/null)
-            echo -e "\n  ${G}[✓]${D} Terdeteksi via Window: ${BD}$pname${D} (PID $pid)" >&2
-            echo "$pid $pname" > "$CACHE"
-            echo "$pid"
-            return 0
-        fi
-    fi
-    
-    if command -v wmctrl >/dev/null 2>&1 && command -v xprop >/dev/null 2>&1; then
-        local wid=$(wmctrl -l 2>/dev/null | awk 'NR==1{print $1}')
-        if [ -n "$wid" ] && [ "$wid" != "-1" ]; then
-            pid=$(xprop -id "$wid" _NET_WM_PID 2>/dev/null | awk -F= '{gsub(/ /,"",$2); print $2}')
-            if [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null; then
-                pname=$(ps -o comm= -p "$pid" 2>/dev/null)
-                echo -e "\n  ${G}[✓]${D} Terdeteksi via WM: ${BD}$pname${D} (PID $pid)" >&2
-                echo "$pid $pname" > "$CACHE"
-                echo "$pid"
-                return 0
+        if [ -n "$cpid" ]; then
+            if [ "$IS_WSL" -eq 1 ]; then
+                tasklist.exe /FI "PID eq $cpid" 2>/dev/null | grep -q "$cpid" && { echo -e "\n  ${Y}[?]${D} Game terakhir: ${G}$cname${D} (PID $cpid)" >&2; read -p "  Pakai ini? (y/n) > " confirm; [ "$confirm" = "y" ] && { echo "$cpid"; return 0; }; }
+            else
+                [ -d "/proc/$cpid" ] && { echo -e "\n  ${Y}[?]${D} Game terakhir: ${G}$cname${D} (PID $cpid)" >&2; read -p "  Pakai ini? (y/n) > " confirm; [ "$confirm" = "y" ] && { echo "$cpid"; return 0; }; }
             fi
         fi
     fi
     
-    # 3. Auto-detect via CPU tinggi
-    pid=$(ps -eo pid,%cpu,comm --sort=-%cpu --no-headers 2>/dev/null | \
-        grep -vE '\s+(bash|sh|ps|top|tboost.*|Xorg|gnome-shell|kwin.*|Xwayland|pulseaudio|pipewire.*|kworker.*)\s*$' | \
-        awk '$2 > 15 {print $1; exit}')
-    if [ -n "$pid" ]; then
-        pname=$(ps -o comm= -p "$pid" 2>/dev/null)
-        echo -e "\n  ${Y}[?]${D} Kandidat: ${G}$pname${D} (PID $pid, CPU ${DM}tinggi${D})" >&2
-        read -p "  Gunakan ini? (y/n, atau 'n' untuk pilih manual) > " confirm
-        if [ "$confirm" = "y" ]; then
-            echo "$pid $pname" > "$CACHE"
-            echo "$pid"
-            return 0
-        fi
+    if [ "$IS_WSL" -eq 1 ]; then
+        wsl_process_picker
+    else
+        linux_process_picker
     fi
-    
-    # 4. Interactive picker
-    echo -e "\n  ${Y}[*]${D} Membuka Process Picker..." >&2
-    sleep 1
-    process_picker
 }
 
 while true; do
     clear
-    OS_NAME="Linux"; grep -qi microsoft /proc/version 2>/dev/null && OS_NAME="WSL"
-    CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "N/A")
+    OS_NAME="Linux"; [ "$IS_WSL" -eq 1 ] && OS_NAME="Windows WSL"
+    
+    # Ambil status CPU
+    if [ "$IS_WSL" -eq 0 ]; then
+        CPU_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "N/A")
+    else
+        CPU_GOV="Windows Host (N/A)"
+    fi
+    
     RAM_U=$(free -m 2>/dev/null | awk '/Mem:/{print $3}')
     RAM_T=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
     CACHED="—"
-    [ -f "$CACHE" ] && [ -d "/proc/$(awk '{print $1}' "$CACHE")" ] 2>/dev/null && CACHED=$(awk '{$1=""; sub(/^ /,""); print}' "$CACHE")
+    [ -f "$CACHE" ] && CACHED=$(awk '{$1=""; sub(/^ /,""); print}' "$CACHE")
 
     echo -e "\n${C}  ╔═══════════════════════════════════════════════════════════╗${D}"
-    echo -e "${C}  ║${D}         ${M}${BD}◆ TBOOST PC REAL v5.0 ($OS_NAME) ◆${D}                ${C}║${D}"
+    echo -e "${C}  ║${D}         ${M}${BD}◆ TBOOST PC REAL v6.0 ($OS_NAME) ◆${D}                ${C}║${D}"
     echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
-    echo -e "${C}  ║${D}  RAM: ${G}${RAM_U}MB${D}/${DM}${RAM_T}MB${D}  |  CPU: ${Y}${CPU_GOV}${D}"
-    echo -e "${C}  ║${D}  Target: ${C}${CACHED}${D}"
+    echo -e "${C}  ║${D}  RAM(WSL): ${G}${RAM_U}MB${D}/${DM}${RAM_T}MB${D}  |  CPU: ${Y}${CPU_GOV}${D}"
+    echo -e "${C}  ║${D}  Target Game: ${C}${CACHED}${D}"
     echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
-    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}REAL BOOST${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 1]${D} ${G}CPU Boost (Performance)${D}  ${BD}[ 2]${D} ${G}Reset CPU${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 3]${D} ${R}★ Boost Game Process${D}    ${BD}[ 4]${D} ${G}Clean RAM Cache${D}"
-    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}NETWORK & I/O${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 5]${D} ${G}TCP BBR (Low Ping)${D}       ${BD}[ 6]${D} ${G}Fast Open${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 7]${D} ${G}FSTRIM (SSD Boost)${D}       ${BD}[ 8]${D} ${G}I/O Scheduler${D}"
-    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}CLEANER${D}"
-    echo -e "${C}  ║${D}   ${BD}[ 9]${D} ${G}Clear Temp & Cache${D}       ${BD}[10]${D} ${G}Clear Logs${D}"
-    echo -e "${C}  ║${D}   ${BD}[11]${D} ${G}Clear APT Cache${D}          ${BD}[12]${D} ${G}Clear DNS Cache${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}BOOST & OPTIMIZATION${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 1]${D} ${G}Select Game Process (Auto/Picker)${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 2]${D} ${R}★ Apply Boost to Selected Game${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 3]${D} ${G}Clean RAM Cache${D}               ${BD}[ 4]${D} ${G}Boost CPU Governor${D}"
+    echo -e "${C}  ║${D} ${Y}◆${D} ${BD}NETWORK & CLEANER${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 5]${D} ${G}TCP BBR & Fast Open${D}           ${BD}[ 6]${D} ${G}Clear Temp & Cache${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 7]${D} ${G}Flush DNS${D}                     ${BD}[ 8]${D} ${G}Clear Game Cache${D}"
     echo -e "${C}  ║${D} ${Y}◆${D} ${BD}MONITOR & VERIFY${D}"
-    echo -e "${C}  ║${D}   ${BD}[13]${D} ${G}Show Top Processes${D}       ${BD}[14]${D} ${G}Deep System Info${D}"
-    echo -e "${C}  ║${D}   ${BD}[15]${D} ${G}Verify Boost Status${D}      ${BD}[16]${D} ${G}Process Picker${D}"
-    echo -e "${C}  ║${D}   ${BD}[17]${D} ${G}Kill Process${D}             ${BD}[18]${D} ${G}Clear Game Cache${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 9]${D} ${G}Show Top Processes${D}            ${BD}[10]${D} ${G}Verify Boost Status${D}"
+    echo -e "${C}  ║${D}   ${BD}[11]${D} ${G}Deep System Info${D}"
     echo -e "${C}  ║${D} ${Y}◆${D} ${BD}MASTER${D}"
-    echo -e "${C}  ║${D}   ${BD}[19]${D} ${R}★ GOD MODE PC${D}             ${BD}[20]${D} ${Y}Restore Default${D}"
-    echo -e "${C}  ║${D}   ${BD}[21]${D} ${G}Benchmark CPU${D}"
+    echo -e "${C}  ║${D}   ${BD}[12]${D} ${R}★ GOD MODE PC${D}                 ${BD}[13]${D} ${Y}Restore Default${D}"
     echo -e "${C}  ║${D}   ${BD}[ 0]${D} ${DM}Exit${D}"
     echo -e "${C}  ╚═══════════════════════════════════════════════════════════╝${D}"
     printf "\n  ${BD}Pilih menu > ${D}"; read choice
 
     case "$choice" in
-        1) check_sudo && {
-            old=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-            spin "Mengubah CPU ke Performance" bash -c "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1"
-            new=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-            echo -e "\n  ${BD}Verifikasi:${D}"
-            echo -e "    Sebelum: ${R}${old}${D}"
-            echo -e "    Sesudah: ${G}${new}${D}"
-            [ "$new" = "performance" ] && echo -e "  ${G}[✓] BERHASIL!${D}" || echo -e "  ${R}[-] Gagal.${D}"
-            read -p "  [Enter]" _
-        } ;;
-        2) check_sudo && {
-            spin "Restore CPU" bash -c "echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1"
-            echo -e "\n  ${G}[✓] CPU: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)${D}"
-            read -p "  [Enter]" _
-        } ;;
-        3) check_sudo && {
-            pid=$(get_game_pid)
-            if [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null; then
-                old_ni=$(ps -o ni= -p "$pid" 2>/dev/null | tr -d ' ')
-                spin "Boost prioritas proses (PID $pid)" bash -c "sudo renice -n -20 -p $pid; sudo ionice -c 1 -n 0 -p $pid"
-                new_ni=$(ps -o ni= -p "$pid" 2>/dev/null | tr -d ' ')
-                pname=$(ps -o comm= -p "$pid" 2>/dev/null)
-                echo -e "\n  ${BD}Target:${D} $pname (PID $pid)"
-                echo -e "  ${BD}Nice:${D}   ${R}${old_ni}${D} → ${G}${new_ni}${D}"
-                echo -e "  ${BD}I/O:${D}    Best-effort → ${G}Realtime${D}"
-                echo -e "\n  ${G}[✓] Proses sekarang prioritas tertinggi!${D}"
+        1) pid=$(get_game_pid); if [ -n "$pid" ]; then echo -e "\n  ${G}[✓]${D} Target disimpan."; fi; read -p "  [Enter]" _ ;;
+        2) 
+            check_sudo
+            if [ ! -f "$CACHE" ]; then echo -e "  ${R}[-] Pilih game dulu di Menu 1.${D}"; read -p "  [Enter]" _; continue; fi
+            pid=$(awk '{print $1}' "$CACHE")
+            pname=$(awk '{$1=""; sub(/^ /,""); print}' "$CACHE")
+            
+            if [ "$IS_WSL" -eq 1 ]; then
+                spin "Boost Windows Game ($pname) via PowerShell" powershell.exe -Command "(Get-Process -Id $pid).PriorityClass = 'RealTime'"
+                echo -e "\n  ${G}[✓] Proses Windows $pname sekarang prioritas REALTIME!${D}"
             else
-                echo -e "  ${R}[-] Dibatalkan / PID tidak valid.${D}"
+                spin "Boost Linux Game ($pname)" bash -c "sudo renice -n -20 -p $pid; sudo ionice -c 1 -n 0 -p $pid"
+                echo -e "\n  ${G}[✓] Prioritas Linux diubah ke REALTIME!${D}"
             fi
-            read -p "  [Enter]" _
-        } ;;
-        4) check_sudo && {
-            old=$(free -m | awk '/Mem:/{print $3}')
-            spin "Bersihkan cache RAM" bash -c "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"
-            new=$(free -m | awk '/Mem:/{print $3}')
-            echo -e "\n  ${BD}RAM Used:${D}  ${R}${old}MB${D} → ${G}${new}MB${D}"
-            echo -e "  ${G}[✓] Cache RAM dibersihkan.${D}"
-            read -p "  [Enter]" _
-        } ;;
-        5) check_sudo && {
-            spin "Aktifkan TCP BBR" bash -c "sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1"
-            echo -e "\n  ${BD}Sekarang:${D} $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')"
-            read -p "  [Enter]" _
-        } ;;
-        6) check_sudo && {
-            spin "Aktifkan TCP Fast Open" bash -c "sudo sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1"
-            echo -e "\n  ${BD}Sekarang:${D} $(sysctl net.ipv4.tcp_fastopen 2>/dev/null | awk '{print $3}')"
-            read -p "  [Enter]" _
-        } ;;
-        7) check_sudo && { clear; sudo fstrim -av; read -p "  [Enter]" _; } ;;
-        8) check_sudo && {
-            spin "Set I/O scheduler" bash -c "for d in /sys/block/nvme*/queue/scheduler /sys/block/sd*/queue/scheduler; do [ -f \$d ] && echo none | sudo tee \$d >/dev/null 2>&1; done"
-            echo -e "  ${G}[✓] Selesai.${D}"; read -p "  [Enter]" _
-        } ;;
-        9) check_sudo && {
-            spin "Hapus /tmp & cache" bash -c "sudo rm -rf /tmp/* 2>/dev/null; rm -rf ~/.cache/* 2>/dev/null"
-            echo -e "  ${G}[✓] Selesai.${D}"; read -p "  [Enter]" _
-        } ;;
-        10) check_sudo && {
-            spin "Bersihkan logs sistem" bash -c "sudo journalctl --vacuum-time=1d >/dev/null 2>&1"
-            echo -e "  ${G}[✓] Selesai.${D}"; read -p "  [Enter]" _
-        } ;;
-        11) check_sudo && {
-            spin "Bersihkan APT" bash -c "sudo apt-get clean; sudo apt-get autoclean -y >/dev/null 2>&1"
-            echo -e "  ${G}[✓] Selesai.${D}"; read -p "  [Enter]" _
-        } ;;
-        12) check_sudo && {
-            spin "Flush DNS" bash -c "command -v resolvectl >/dev/null && sudo resolvectl flush-caches || sudo systemd-resolve --flush-caches"
-            echo -e "  ${G}[✓] Selesai.${D}"; read -p "  [Enter]" _
-        } ;;
-        13) clear; echo -e "${BD}Top 20 Proses:${D}\n"; ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -21; read -p "  [Enter]" _ ;;
-        14) clear; echo -e "${C}◆ SYSTEM INFO ◆${D}\n"; lscpu 2>/dev/null | grep -E 'Model name|Core|Thread|MHz'; echo -e "\n${BD}RAM:${D}"; free -h; echo -e "\n${BD}Governor:${D} $CPU_GOV"; echo -e "\n${BD}Suhu:${D}"; sensors 2>/dev/null | grep -E 'Core|Package' || echo "(sudo apt install lm-sensors)"; read -p "  [Enter]" _ ;;
-        15) clear; echo -e "${C}◆ VERIFIKASI BOOST ◆${D}\n"
-            echo -e "  ${BD}1. CPU Governor:${D} $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'N/A')"
-            echo -e "  ${BD}2. TCP CC:${D}       $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')"
-            echo -e "  ${BD}3. Swappiness:${D}   $(cat /proc/sys/vm/swappiness)"
-            echo -e "  ${BD}4. Cached RAM:${D}   $(free -m | awk '/Mem:/{print $6}')MB"
-            echo -e "  ${BD}5. RAM Used:${D}     $(free -m | awk '/Mem:/{print $3}')MB"
-            echo -e "\n  ${DM}Kalau Governor='performance' dan TCP CC='bbr', berarti boost BENAR-BENAR aktif di Kernel.${D}"
-            read -p "  [Enter]" _ ;;
-        16) process_picker; read -p "  [Enter]" _ ;;
-        17) check_sudo && {
-            clear; ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -21
-            printf "\n  ${BD}PID yang ingin di-kill (spasi):${D} "; read pids
-            for p in $pids; do spin "Kill PID $p" bash -c "sudo kill -9 $p 2>/dev/null"; done
-            read -p "  [Enter]" _
-        } ;;
-        18) rm -f "$CACHE"; echo -e "  ${G}[✓] Cache target dibersihkan.${D}"; read -p "  [Enter]" _ ;;
-        19) check_sudo && {
-            clear; echo -e "${R}${BD}[*] PC GOD MODE...${D}\n"
-            old=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-            spin "Boost CPU" bash -c "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1"
-            spin "Clean RAM" bash -c "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"
-            spin "TCP BBR" bash -c "sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1"
-            spin "Swappiness=10" bash -c "sudo sysctl -w vm.swappiness=10 >/dev/null 2>&1"
-            spin "Compact Memory" bash -c "echo 1 | sudo tee /proc/sys/vm/compact_memory >/dev/null"
-            pid=$(get_game_pid)
-            if [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null; then
-                spin "Boost Game PID $pid" bash -c "sudo renice -n -20 -p $pid; sudo ionice -c 1 -n 0 -p $pid"
-            fi
-            echo -e "\n  ${G}${BD}[✓] PC GOD MODE ACTIVE!${D}"
-            echo -e "  CPU: ${R}${old}${D} → ${G}$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)${D}"
-            read -p "  [Enter]" _
-        } ;;
-        20) check_sudo && {
-            spin "Restore default" bash -c "echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1; sudo sysctl -w vm.swappiness=60 >/dev/null 2>&1; sudo sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1"
-            echo -e "\n  ${G}[✓] Sistem normal.${D}"; read -p "  [Enter]" _
-        } ;;
-        21) clear; echo -e "${Y}CPU Benchmark 5 detik...${D}\n"; start=$(date +%s%N); count=0
-            while true; do x=$((RANDOM*RANDOM)); count=$((count+1)); now=$(date +%s%N); [ $(( (now-start)/1000000000 )) -ge 5 ] && break; done
-            elapsed=$(( (now-start)/1000000 )); score=$((count*1000/elapsed))
-            echo -e "  Skor: ${G}$score${D} | Waktu: ${elapsed}ms"
             read -p "  [Enter]" _
         ;;
+        3) check_sudo && { old=$(free -m | awk '/Mem:/{print $3}'); spin "Clean RAM" bash -c "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"; new=$(free -m | awk '/Mem:/{print $3}'); echo -e "\n  RAM: ${R}${old}MB${D} -> ${G}${new}MB${D}"; read -p "  [Enter]" _; } ;;
+        4) 
+            if [ "$IS_WSL" -eq 1 ]; then echo -e "  ${R}[-] Di WSL, CPU Governor diatur oleh Windows Power Plan.${D}"; else check_sudo && { spin "Set CPU Performance" bash -c "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1"; echo -e "  ${G}[✓] CPU Boosted.${D}"; }; fi
+            read -p "  [Enter]" _
+        ;;
+        5) check_sudo && { spin "Network BBR" bash -c "sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; sudo sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1"; echo -e "  ${G}[✓] Network Optimized.${D}"; read -p "  [Enter]" _; } ;;
+        6) check_sudo && { spin "Clean Temp" bash -c "sudo rm -rf /tmp/* 2>/dev/null; rm -rf ~/.cache/* 2>/dev/null"; echo -e "  ${G}[✓] Cleaned.${D}"; read -p "  [Enter]" _; } ;;
+        7) check_sudo && { spin "Flush DNS" bash -c "command -v resolvectl >/dev/null && sudo resolvectl flush-caches"; echo -e "  ${G}[✓] DNS Flushed.${D}"; read -p "  [Enter]" _; } ;;
+        8) rm -f "$CACHE"; echo -e "  ${G}[✓] Cache target dibersihkan.${D}"; read -p "  [Enter]" _ ;;
+        9) clear; if [ "$IS_WSL" -eq 1 ]; then echo -e "${BD}Top Windows Processes (Tasklist):${D}\n"; tasklist.exe /fo table | head -25; else echo -e "${BD}Top Linux Processes:${D}\n"; ps -eo pid,%cpu,%mem,comm --sort=-%cpu | head -20; fi; read -p "  [Enter]" _ ;;
+        10) clear; echo -e "${C}◆ VERIFIKASI STATUS ◆${D}\n"; echo -e "  Target Game : ${G}${CACHED}${D}"; echo -e "  OS Mode     : ${G}${OS_NAME}${D}"; if [ "$IS_WSL" -eq 0 ]; then echo -e "  CPU Gov     : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"; fi; read -p "  [Enter]" _ ;;
+        11) clear; if [ "$IS_WSL" -eq 1 ]; then echo -e "${C}◆ WSL INFO ◆${D}"; uname -a; echo -e "\n${BD}Windows Host:${D}"; cmd.exe /c ver 2>/dev/null; else echo -e "${C}◆ LINUX INFO ◆${D}"; lscpu | grep 'Model name'; free -h; fi; read -p "  [Enter]" _ ;;
+        12) 
+            check_sudo
+            echo -e "${R}${BD}[*] PC GOD MODE...${D}\n"
+            spin "Clean RAM" bash -c "sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null"
+            spin "Network Boost" bash -c "sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1"
+            if [ "$IS_WSL" -eq 0 ]; then spin "CPU Boost" bash -c "echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1"; fi
+            
+            if [ -f "$CACHE" ]; then
+                pid=$(awk '{print $1}' "$CACHE")
+                pname=$(awk '{$1=""; sub(/^ /,""); print}' "$CACHE")
+                if [ "$IS_WSL" -eq 1 ]; then
+                    spin "Boost Game ($pname)" powershell.exe -Command "(Get-Process -Id $pid).PriorityClass = 'RealTime'"
+                else
+                    spin "Boost Game ($pname)" bash -c "sudo renice -n -20 -p $pid; sudo ionice -c 1 -n 0 -p $pid"
+                fi
+            fi
+            echo -e "\n  ${G}${BD}[✓] GOD MODE AKTIF!${D}"; read -p "  [Enter]" _
+        ;;
+        13) check_sudo && { spin "Restore" bash -c "sudo sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1; echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1"; echo -e "  ${G}[✓] Default.${D}"; read -p "  [Enter]" _; } ;;
         0) exit 0 ;;
     esac
 done
+
