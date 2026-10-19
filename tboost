@@ -3000,6 +3000,7 @@ cmd_menu() {
         printf '%s\n' "${M}  ◆ QUICK TWEAKS & MONITOR${D}"
         printf '%s\n' "  ${BD}[19]${D} ${Y}Toggle Animasi HP${D}   ${BD}[20]${D} ${G}Thermal Debugger${D}"
         printf '%s\n' "  ${BD}[21]${D} ${G}Live Dashboard${D}      ${BD}[22]${D} ${Y}Restore Default${D}"
+        printf "%s\n" "  ${BD}[23]${D} ${Y}Switch to PC Mode${D}"
         printf '%s\n' "  ${BD}[ 0]${D} ${DM}Exit${D}"
         printf '\n'
         printf '%s' "${BD}  Pilih menu [0-22] > ${D}"
@@ -3027,6 +3028,7 @@ cmd_menu() {
             20) cmd_temp_debug ;;
             21) cmd_dash ;;
             22) cmd_restore ;;
+            23) exec bash ./tboost-pc ;;
             0)  exit 0 ;;
         esac
     done
@@ -3043,6 +3045,131 @@ main() {
         io)         cmd_io_boost ;;
         tempdbg)    cmd_temp_debug ;;
         *)          cmd_menu ;;
+    esac
+}
+main "$@"
+
+# ==========================================
+# PC MODE ENGINE (LINUX / WINDOWS WSL / MAC)
+# ==========================================
+cmd_pc_menu() {
+    while true; do
+        clear
+        local os_name="PC"
+        grep -qi microsoft /proc/version && os_name="Windows WSL"
+        [ "$(uname)" = "Darwin" ] && os_name="macOS"
+        
+        local ram_used=$(free -m 2>/dev/null | awk '/Mem:/{print $3}')
+        local ram_total=$(free -m 2>/dev/null | awk '/Mem:/{print $2}')
+
+        printf "\n${C}  ╔═══════════════════════════════════════════════════════════╗${D}\n"
+        printf "${C}  ║${D}         ${M}${BD}◆ PC EDITION v1.0 ◆${D}                          ${C}║${D}\n"
+        printf "${C}  ╠═══════════════════════════════════════════════════════════╣${D}\n"
+        printf "${C}  ║${D}   OS: ${G}${os_name}${D} | RAM: ${G}${ram_used}MB${D} / ${DM}${ram_total}MB${D} ${C}║${D}\n"
+        printf "${C}  ╠═══════════════════════════════════════════════════════════╣${D}\n"
+        printf "${C}  ║${D}   ${BD}[ 1]${D} ${G}Turbo Boost (Max CPU)${D}    ${BD}[ 2]${D} ${G}Clean RAM (Drop Cache)${D}${C}║${D}\n"
+        printf "${C}  ║${D}   ${BD}[ 3]${D} ${G}Kill Heavy Processes${D}     ${BD}[ 4]${D} ${G}Network Ping Test${D}    ${C}║${D}\n"
+        printf "${C}  ║${D}   ${BD}[ 5]${D} ${G}System Specs & Temp${D}      ${BD}[ 6]${D} ${G}Restore PC Default${D}   ${C}║${D}\n"
+        printf "${C}  ╠═══════════════════════════════════════════════════════════╣${D}\n"
+        printf "${C}  ║${D}   ${BD}[ 9]${D} ${Y}Switch to HP Mode (Android)${D}                     ${C}║${D}\n"
+        printf "${C}  ║${D}   ${BD}[ 0]${D} ${DM}Exit Application${D}                                    ${C}║${D}\n"
+        printf "${C}  ╚═══════════════════════════════════════════════════════════╝${D}\n"
+        printf "\n  ${BD}Pilih menu [0-9] > ${D}"
+        read choice
+        case "$choice" in
+            1) cmd_pc_turbo ;;
+            2) cmd_pc_ram ;;
+            3) cmd_pc_kill ;;
+            4) cmd_ping; read -p "  [Enter] " _ ;;
+            5) cmd_pc_specs ;;
+            6) cmd_pc_restore ;;
+            9) cmd_switch_os "hp" ;;
+            0) exit 0 ;;
+        esac
+    done
+}
+
+cmd_pc_turbo() {
+    clear
+    printf "\n  ${Y}[*]${D} Menaikkan CPU Governor ke PERFORMANCE...\n"
+    if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
+        echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null
+        printf "  ${G}[+]${D} CPU Governor diset ke Performance.\n"
+    else
+        printf "  ${R}[!]${D} Tidak dapat mengubah CPU governor (OS tidak mendukung).\n"
+    fi
+    read -p "  [Enter] " _
+}
+
+cmd_pc_ram() {
+    clear
+    printf "\n  ${Y}[*]${D} Membersihkan RAM (Drop Caches)...\n"
+    sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+    printf "  ${G}[+]${D} RAM berhasil dibersihkan!\n"
+    read -p "  [Enter] " _
+}
+
+cmd_pc_kill() {
+    clear
+    printf "\n  ${Y}[*]${D} Top 10 Proses Pemakan RAM:\n"
+    ps -eo pid,comm,%mem --sort=-%mem | head -11
+    printf "\n  ${Y}[*]${D} Masukkan PID yang mau di-kill (pisahkan dengan spasi): "
+    read pids
+    for p in $pids; do sudo kill -9 "$p" 2>/dev/null; done
+    printf "  ${G}[+]${D} Proses dibersihkan.\n"
+    read -p "  [Enter] " _
+}
+
+cmd_pc_specs() {
+    clear
+    printf "\n  ${C}◆ SYSTEM SPECS ◆${D}\n\n"
+    [ -f /proc/cpuinfo ] && grep -m1 "model name" /proc/cpuinfo | awk -F: '{print "  CPU: "$2}'
+    printf "  RAM: $(free -h | awk '/Mem:/{print $3" / "$2}')\n"
+    read -p "  [Enter] " _
+}
+
+cmd_pc_restore() {
+    clear
+    printf "\n  ${Y}[*]${D} Mengembalikan CPU Governor ke Default...\n"
+    echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1
+    printf "  ${G}[+]${D} Sistem PC kembali normal.\n"
+    read -p "  [Enter] " _
+}
+
+cmd_switch_os() {
+    local target="$1"
+    if [ "$target" = "pc" ]; then
+        echo "pc" > "$HOME/.tboost_mode"
+        cmd_pc_menu
+    elif [ "$target" = "hp" ]; then
+        echo "hp" > "$HOME/.tboost_mode"
+        cmd_menu
+    fi
+}
+
+detect_and_run() {
+    local saved_mode=""
+    [ -f "$HOME/.tboost_mode" ] && saved_mode=$(cat "$HOME/.tboost_mode")
+    if [ "$saved_mode" = "pc" ]; then cmd_pc_menu
+    elif [ "$saved_mode" = "hp" ]; then cmd_menu
+    else
+        if [ -d "/data/data/com.termux" ]; then cmd_menu; else cmd_pc_menu; fi
+    fi
+}
+
+main() {
+    detect_root
+    case "${1:-menu}" in
+        menu|"")    detect_and_run ;;
+        pc)         cmd_switch_os "pc" ;;
+        hp)         cmd_switch_os "hp" ;;
+        god)        cmd_god_mode ;;
+        dash)       cmd_dash ;;
+        anim)       cmd_anim_toggle ;;
+        thermal)    cmd_thermal_bypass ;;
+        io)         cmd_io_boost ;;
+        tempdbg)    cmd_temp_debug ;;
+        *)          detect_and_run ;;
     esac
 }
 main "$@"

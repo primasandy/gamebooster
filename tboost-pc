@@ -1,0 +1,134 @@
+#!/bin/bash
+R='\033[1;31m'; G='\033[1;32m'; Y='\033[1;33m'; C='\033[1;36m'; M='\033[1;35m'; W='\033[1;37m'; D='\033[0m'; BD='\033[1m'; DM='\033[2m'
+
+IS_ANDROID=0
+[ -d "/data/data/com.termux" ] && IS_ANDROID=1
+
+IS_ROOT="NO"
+if [ "$IS_ANDROID" -eq 0 ]; then
+    if [ "$(id -u)" -eq 0 ] || (sudo -n true 2>/dev/null); then
+        IS_ROOT="YES"
+    fi
+fi
+
+while true; do
+    clear
+    OS_NAME="Linux"
+    grep -qi microsoft /proc/version 2>/dev/null && OS_NAME="Windows WSL"
+    [ "$(uname)" = "Darwin" ] && OS_NAME="macOS"
+
+    echo -e "\n${C}  ╔═══════════════════════════════════════════════════════════╗${D}"
+    echo -e "${C}  ║${D}         ${M}${BD}◆ TBOOST PC EDITION v2.0 ◆${D}                  ${C}║${D}"
+    echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
+    
+    if [ "$IS_ANDROID" -eq 1 ]; then
+        echo -e "${C}  ║${D} ${R}${BD}[!] WARNING: ANDROID DETECTED${D}                         ${C}║${D}"
+        echo -e "${C}  ║${D} ${Y}PC Mode tidak akan bekerja maksimal di HP.${D}                ${C}║${D}"
+        echo -e "${C}  ║${D} ${Y}Silakan kembali ke HP Mode (Menu 9).${D}                      ${C}║${D}"
+    else
+        echo -e "${C}  ║${D} Status OS : ${G}${BD}${OS_NAME} (ACTIVE)${D}                          ${C}║${D}"
+    fi
+    
+    if [ "$IS_ROOT" = "YES" ]; then
+        echo -e "${C}  ║${D} Root/Sudo : ${G}${BD}[ ENABLED ]${D}                               ${C}║${D}"
+    else
+        echo -e "${C}  ║${D} Root/Sudo : ${R}${BD}[ DISABLED ]${D}                              ${C}║${D}"
+    fi
+    echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 1]${D} ${G}Enable Root/Sudo Permission${D}                   ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 2]${D} ${G}Deep System Scan (Read Everything)${D}            ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 3]${D} ${G}Turbo Boost (Performance Mode)${D}                ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 4]${D} ${G}Clean RAM (Drop Caches)${D}                       ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 5]${D} ${G}Network Latency Optimize${D}                      ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 6]${D} ${G}Kill Heavy Processes${D}                          ${C}║${D}"
+    echo -e "${C}  ╠═══════════════════════════════════════════════════════════╣${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 9]${D} ${Y}Switch to HP Mode (Android)${D}                     ${C}║${D}"
+    echo -e "${C}  ║${D}   ${BD}[ 0]${D} ${DM}Exit Application${D}                               ${C}║${D}"
+    echo -e "${C}  ╚═══════════════════════════════════════════════════════════╝${D}"
+    printf "\n  ${BD}Pilih menu [0-9] > ${D}"
+    read choice
+
+    if [ "$IS_ANDROID" -eq 1 ] && [ "$choice" != "9" ] && [ "$choice" != "0" ]; then
+        echo -e "\n  ${R}[!] Akses Ditolak. Fitur ini hanya untuk PC asli.${D}"
+        read -p "  [Enter] " _
+        continue
+    fi
+
+    case "$choice" in
+        1) 
+            echo -e "\n${Y}[*] Meminta izin Root/Sudo...${D}"
+            if [ "$(id -u)" -eq 0 ]; then
+                echo -e "${G}[+] Anda sudah login sebagai ROOT.${D}"
+            elif sudo -v; then
+                echo -e "${G}[+] Sudo berhasil diaktifkan!${D}"
+                IS_ROOT="YES"
+            else
+                echo -e "${R}[-] Gagal mendapatkan akses Sudo.${D}"
+            fi
+            read -p "  [Enter] " _ 
+            ;;
+        2) 
+            clear
+            echo -e "\n${C}◆ DEEP SYSTEM SCAN ◆${D}\n"
+            echo -e "${Y}[OS]${D}"
+            uname -a
+            echo -e "\n${Y}[CPU]${D}"
+            lscpu 2>/dev/null | grep -E 'Model name|Architecture|CPU\(s\)|Thread|Core|MHz' || grep -m1 'model name' /proc/cpuinfo
+            echo -e "\n${Y}[MEMORY]${D}"
+            free -h
+            echo -e "\n${Y}[DISK]${D}"
+            df -h / 2>/dev/null
+            echo -e "\n${Y}[TEMPERATURE]${D}"
+            sensors 2>/dev/null | grep -E 'Core|Package' || echo "Sensors tidak terinstal (sudo apt install lm-sensors)"
+            read -p "  [Enter] " _
+            ;;
+        3) 
+            echo -e "\n${Y}[*] Mengubah CPU Governor ke PERFORMANCE...${D}"
+            if [ "$IS_ROOT" = "YES" ]; then
+                echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1
+                echo -e "${G}[+] CPU di-boost ke performa maksimal.${D}"
+            else
+                echo -e "${R}[-] Butuh Sudo (Menu 1).${D}"
+            fi
+            read -p "  [Enter] " _
+            ;;
+        4) 
+            echo -e "\n${Y}[*] Membersihkan RAM (Drop Caches)...${D}"
+            if [ "$IS_ROOT" = "YES" ]; then
+                sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+                echo -e "${G}[+] RAM berhasil dibersihkan.${D}"
+            else
+                echo -e "${R}[-] Butuh Sudo (Menu 1).${D}"
+            fi
+            read -p "  [Enter] " _
+            ;;
+        5) 
+            echo -e "\n${Y}[*] Mengoptimalkan Jaringan (TCP BBR & Fast Open)...${D}"
+            if [ "$IS_ROOT" = "YES" ]; then
+                sudo sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
+                sudo sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
+                sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+                echo -e "${G}[+] Jaringan dioptimalkan (Low Latency).${D}"
+            else
+                echo -e "${R}[-] Butuh Sudo (Menu 1).${D}"
+            fi
+            read -p "  [Enter] " _
+            ;;
+        6) 
+            clear
+            echo -e "\n${Y}[*] Top 10 Proses Pemakan RAM:${D}"
+            ps -eo pid,comm,%mem --sort=-%mem | head -11
+            echo -e "\n${Y}[*] Masukkan PID yang ingin dimatikan (pisah spasi): ${D}"
+            read pids
+            for p in $pids; do sudo kill -9 "$p" 2>/dev/null; done
+            echo -e "${G}[+] Proses dibersihkan.${D}"
+            read -p "  [Enter] " _
+            ;;
+        9) 
+            exec bash ./tboost 
+            ;;
+        0) exit 0 ;;
+    esac
+done
+
+
